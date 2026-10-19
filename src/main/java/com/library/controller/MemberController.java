@@ -38,7 +38,7 @@ public class MemberController {
 	}
 
 	@GetMapping
-	@Operation(summary = "List members", description = "Librarian only")
+	@Operation(operationId = "getMembers", summary = "List members", description = "Librarian only")
 	public PageResponse<MemberResponse> list(
 			@RequestParam(defaultValue = "0") @Min(0) int page,
 			@RequestParam(defaultValue = "20") @Min(1) @Max(100) int size) {
@@ -46,20 +46,21 @@ public class MemberController {
 	}
 
 	@GetMapping("/{id}")
-	@Operation(summary = "Get one member", description = "A librarian can read any member. A member can read only their own record.")
+	@Operation(operationId = "getMember", summary = "Get one member", description = "A librarian can read any member. A member can read only their own record.")
 	public MemberResponse get(@PathVariable @Positive Long id) {
 		return members.get(id);
 	}
 
 	@PostMapping
 	@ResponseStatus(HttpStatus.CREATED)
-	@Operation(summary = "Register a member", description = "Librarian only")
+	@Operation(operationId = "registerMember", summary = "Register a member",
+			description = "Librarian only. Stores a login password; the member signs in with their email and this password.")
 	public MemberResponse create(@Valid @RequestBody MemberRequest request) {
 		return members.create(request);
 	}
 
 	@PatchMapping("/{id}")
-	@Operation(summary = "Update a member name", description = "Librarian only")
+	@Operation(operationId = "updateMember", summary = "Update a member name", description = "Librarian only")
 	public MemberResponse update(@PathVariable @Positive Long id, @Valid @RequestBody MemberUpdateRequest request) {
 		return members.update(id, request);
 	}

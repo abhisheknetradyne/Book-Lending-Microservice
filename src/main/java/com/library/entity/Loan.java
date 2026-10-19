@@ -75,14 +75,6 @@ public class Loan {
 		return book.getId();
 	}
 
-	public Member getMember() {
-		return member;
-	}
-
-	public Book getBook() {
-		return book;
-	}
-
 	public Instant getBorrowedAt() {
 		return borrowedAt;
 	}

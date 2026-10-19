@@ -8,15 +8,15 @@ import com.library.config.LibraryUser;
 import com.library.entity.Member;
 import com.library.exception.ForbiddenException;
 import com.library.exception.NotFoundException;
-import com.library.repository.SqlSession;
+import com.library.dao.MemberDao;
 
 @Component
 public class CurrentUser {
 
-	private final SqlSession sqlSession;
+	private final MemberDao members;
 
-	public CurrentUser(SqlSession sqlSession) {
-		this.sqlSession = sqlSession;
+	public CurrentUser(MemberDao members) {
+		this.members = members;
 	}
 
 	public boolean librarian() {
@@ -30,7 +30,7 @@ public class CurrentUser {
 		if (user.memberEmail() == null || user.memberEmail().isBlank()) {
 			throw new ForbiddenException("This account is not linked to a library member");
 		}
-		return sqlSession.findMemberByEmail(user.memberEmail())
+		return members.findMemberByEmail(user.memberEmail())
 				.orElseThrow(() -> new NotFoundException("No library member matches this login"));
 	}
 
@@ -43,11 +43,6 @@ public class CurrentUser {
 			throw new ForbiddenException("Members can only act on their own account");
 		}
 	}
-
-	public void assertCanReadMember(Long memberId) {
-		assertCanActFor(memberId);
-	}
-
 	private LibraryUser principal() {
 		Object principal = authentication().getPrincipal();
 		if (principal instanceof LibraryUser user) {

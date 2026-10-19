@@ -20,7 +20,7 @@ public class OpenApiConfig {
 						.description("""
 								Catalog, members, and lending.
 								Sign in with HTTP Basic. Librarian: librarian / password. Member: member / password.
-								Health is at GET /actuator/health and does not require a login.
+								Health is at GET /actuator/health/liveness and GET /actuator/health/readiness and does not require a login.
 								"""))
 				.components(new Components().addSecuritySchemes("basicAuth",
 						new SecurityScheme().type(SecurityScheme.Type.HTTP).scheme("basic")));

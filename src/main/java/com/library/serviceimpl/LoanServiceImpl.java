@@ -10,131 +10,146 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import com.library.config.BorrowingProperties;
-import com.library.domain.rules.BorrowingContext;
-import com.library.domain.rules.BorrowingPolicy;
-import com.library.domain.rules.BorrowingRuleRegistry;
-import com.library.domain.rules.LoanDurationPolicy;
-import com.library.domain.rules.RuleResult;
+import com.library.config.InMemoryBorrowingRules;
+import com.library.dao.BookDao;
+import com.library.dao.LoanDao;
+import com.library.dao.MemberDao;
+import com.library.rules.BorrowingContext;
+import com.library.rules.BorrowingRules;
+import com.library.rules.RuleResult;
 import com.library.dto.LoanRequest;
 import com.library.dto.LoanResponse;
 import com.library.entity.Book;
 import com.library.entity.Loan;
 import com.library.entity.Member;
-import com.library.exception.BorrowingRejectedException;
+import com.library.exception.BadRequestException;
+import com.library.exception.ConflictException;
 import com.library.exception.ForbiddenException;
 import com.library.exception.NotFoundException;
-import com.library.repository.SqlSession;
 import com.library.service.CurrentUser;
 import com.library.service.LoanService;
-
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
+import com.library.service.MetricsService;
 
 @Service
 public class LoanServiceImpl implements LoanService {
 
 	private static final Logger log = LoggerFactory.getLogger(LoanServiceImpl.class);
 
-	private final SqlSession sqlSession;
-	private final BorrowingProperties borrowingProperties;
-	private final BorrowingRuleRegistry registry;
-	private final LoanDurationPolicy durationPolicy;
+	private final MemberDao members;
+	private final BookDao books;
+	private final LoanDao loans;
+	private final InMemoryBorrowingRules borrowingRulesConfig;
+	private final BorrowingRules borrowingRules;
 	private final CurrentUser currentUser;
 	private final Clock clock;
-	private final MeterRegistry meterRegistry;
+	private final MetricsService metrics;
 
-	public LoanServiceImpl(SqlSession sqlSession, BorrowingProperties borrowingProperties, BorrowingRuleRegistry registry,
-			LoanDurationPolicy durationPolicy, CurrentUser currentUser, Clock clock, MeterRegistry meterRegistry) {
-		this.sqlSession = sqlSession;
-		this.borrowingProperties = borrowingProperties;
-		this.registry = registry;
-		this.durationPolicy = durationPolicy;
+	public LoanServiceImpl(MemberDao members, BookDao books, LoanDao loans, InMemoryBorrowingRules borrowingRulesConfig,
+			BorrowingRules borrowingRules, CurrentUser currentUser, Clock clock, MetricsService metrics) {
+		this.members = members;
+		this.books = books;
+		this.loans = loans;
+		this.borrowingRulesConfig = borrowingRulesConfig;
+		this.borrowingRules = borrowingRules;
 		this.currentUser = currentUser;
 		this.clock = clock;
-		this.meterRegistry = meterRegistry;
+		this.metrics = metrics;
 	}
 
 	@Override
 	@Transactional
 	public LoanResponse borrow(LoanRequest request) {
-		Timer.Sample sample = Timer.start(meterRegistry);
-		try {
-			currentUser.assertCanActFor(request.memberId());
-			Member member = sqlSession.find(Member.class, request.memberId())
-					.orElseThrow(() -> new NotFoundException("Member not found"));
-			Book book = sqlSession.findForUpdate(Book.class, request.bookId())
-					.orElseThrow(() -> new NotFoundException("Book not found"));
-			BorrowingPolicy currentRules = borrowingPolicy();
-			Instant now = clock.instant();
-			BorrowingContext context = new BorrowingContext(member, book, sqlSession.findOpenLoans(member.getId()), now, currentRules);
-			RuleResult result = registry.evaluate(context);
-			if (!result.allowed()) {
-				meterRegistry.counter("library.loans.rejected", "code", result.code()).increment();
-				log.info("borrow rejected memberId={} bookId={} code={}", member.getId(), book.getId(), result.code());
-				throw new BorrowingRejectedException(result.code(), result.message());
-			}
-			Instant dueDate = durationPolicy.dueDate(now, currentRules);
-			book.borrowOne();
-			sqlSession.save(book);
-			Loan loan = sqlSession.save(Loan.open(member, book, now, dueDate));
-			meterRegistry.counter("library.loans.borrowed").increment();
-			log.info("borrow allowed memberId={} bookId={} loanId={} dueDate={}", member.getId(), book.getId(), loan.getId(), dueDate);
-			return new LoanResponse(loan);
+		long started = System.nanoTime();
+		log.info("borrow started memberId={} bookId={}", request.memberId(), request.bookId());
+		currentUser.assertCanActFor(request.memberId());
+		Member member = members.findById(request.memberId())
+				.orElseThrow(() -> {
+					log.warn("borrow failed memberId={} bookId={} reason=member not found", request.memberId(), request.bookId());
+					return new NotFoundException("Member not found");
+				});
+		Book book = books.findByIdForUpdate(request.bookId())
+				.orElseThrow(() -> {
+					log.warn("borrow failed memberId={} bookId={} reason=book not found", request.memberId(), request.bookId());
+					return new NotFoundException("Book not found");
+				});
+		Instant now = clock.instant();
+		var rules = borrowingRulesConfig.current();
+		BorrowingContext context = new BorrowingContext(member, book, loans.findOpenLoans(member.getId()), now, rules);
+		RuleResult result = borrowingRules.evaluate(context);
+		if (!result.allowed()) {
+			metrics.recordRejected(result.code());
+			log.warn("borrow rejected memberId={} bookId={} code={}", member.getId(), book.getId(), result.code());
+			throw new ConflictException(result.code(), result.message());
 		}
-		finally {
-			sample.stop(meterRegistry.timer("library.loans.borrow"));
-		}
+		Instant dueDate = borrowingRules.dueDate(now, rules);
+		book.borrowOne();
+		books.save(book);
+		Loan loan = loans.save(Loan.open(member, book, now, dueDate));
+		long durationMs = (System.nanoTime() - started) / 1_000_000;
+		metrics.recordBorrowed(durationMs);
+		log.info("borrow allowed memberId={} bookId={} loanId={} dueDate={}", member.getId(), book.getId(), loan.getId(), dueDate);
+		return new LoanResponse(loan);
 	}
 
 	@Override
 	@Transactional
-	public LoanResponse returnBook(Long loanId) {
-		Loan loan = sqlSession.findLoan(loanId).orElseThrow(() -> new NotFoundException("Loan not found"));
-		currentUser.assertCanActFor(loan.getMemberId());
-		Instant now = clock.instant();
-		if (!loan.isOpen()) {
-			return new LoanResponse(loan);
+	public LoanResponse returnBook(LoanRequest request) {
+		log.info("return started memberId={} bookId={}", request.memberId(), request.bookId());
+		currentUser.assertCanActFor(request.memberId());
+		members.findById(request.memberId()).orElseThrow(() -> {
+			log.warn("return failed memberId={} bookId={} reason=member not found", request.memberId(), request.bookId());
+			return new NotFoundException("Member not found");
+		});
+		books.findById(request.bookId()).orElseThrow(() -> {
+			log.warn("return failed memberId={} bookId={} reason=book not found", request.memberId(), request.bookId());
+			return new NotFoundException("Book not found");
+		});
+		Loan open = loans.findOpenLoan(request.memberId(), request.bookId()).orElse(null);
+		if (open == null) {
+			Loan previous = loans.findLatestLoan(request.memberId(), request.bookId())
+					.filter(loan -> !loan.isOpen())
+					.orElseThrow(() -> {
+						log.warn("return failed memberId={} bookId={} reason=loan not found", request.memberId(),
+								request.bookId());
+						return new NotFoundException("Loan not found");
+					});
+			log.info("return already completed memberId={} bookId={} loanId={}", request.memberId(), request.bookId(),
+					previous.getId());
+			return new LoanResponse(previous);
 		}
-		Book book = sqlSession.findForUpdate(Book.class, loan.getBookId())
+		Instant now = clock.instant();
+		Book book = books.findByIdForUpdate(open.getBookId())
 				.orElseThrow(() -> new NotFoundException("Book not found"));
-		loan.markReturned(now);
+		open.markReturned(now);
 		book.returnOne();
-		sqlSession.save(book);
-		sqlSession.save(loan);
-		meterRegistry.counter("library.loans.returned").increment();
-		log.info("return loanId={} memberId={} bookId={}", loan.getId(), loan.getMemberId(), book.getId());
-		return new LoanResponse(loan);
+		books.save(book);
+		loans.save(open);
+		metrics.recordReturned();
+		log.info("return loanId={} memberId={} bookId={}", open.getId(), open.getMemberId(), book.getId());
+		return new LoanResponse(open);
 	}
 
 	@Override
 	@Transactional(readOnly = true)
-	public LoanResponse get(Long loanId) {
-		Loan loan = sqlSession.findLoan(loanId).orElseThrow(() -> new NotFoundException("Loan not found"));
-		currentUser.assertCanActFor(loan.getMemberId());
-		return new LoanResponse(loan);
-	}
-
-	@Override
-	@Transactional(readOnly = true)
-	public Page<LoanResponse> list(Long memberId, int page, int size) {
-		Long scopedMemberId = memberId;
+	public Page<LoanResponse> borrowingHistory(Long memberId, int page, int size) {
+		log.info("borrow history memberId={} page={} size={}", memberId, page, size);
+		if (memberId == null || memberId <= 0) {
+			log.warn("borrow history rejected reason=invalid member id memberId={}", memberId);
+			throw new BadRequestException("invalid member id");
+		}
 		if (!currentUser.librarian()) {
 			Member self = currentUser.requireMemberAccount();
-			if (memberId != null && !memberId.equals(self.getId())) {
+			if (!memberId.equals(self.getId())) {
+				log.warn("borrow history rejected memberId={} reason=forbidden", memberId);
 				throw new ForbiddenException("Members can only list their own loans");
 			}
-			scopedMemberId = self.getId();
+		}
+		if (members.findById(memberId).isEmpty()) {
+			log.warn("borrow history rejected reason=invalid member id memberId={}", memberId);
+			throw new BadRequestException("invalid member id");
 		}
 		Pageable pageable = Pages.of(page, size);
-		return sqlSession.findLoans(scopedMemberId, pageable).map(LoanResponse::new);
-	}
-
-	private BorrowingPolicy borrowingPolicy() {
-		return new BorrowingPolicy(
-				borrowingProperties.maxActiveLoans(),
-				borrowingProperties.blockWhenOverdue(),
-				borrowingProperties.loanDurationDays());
+		return loans.findLoans(memberId, pageable).map(LoanResponse::new);
 	}
 
 }

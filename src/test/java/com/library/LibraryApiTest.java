@@ -5,13 +5,17 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -23,10 +27,12 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import com.jayway.jsonpath.JsonPath;
+import com.library.config.BorrowingProperties;
+import com.library.config.InMemoryBorrowingRules;
 import com.library.entity.Member;
-import com.library.repository.SqlSession;
+import com.library.dao.LoanDao;
+import com.library.dao.MemberDao;
 
-import io.micrometer.core.instrument.MeterRegistry;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -37,19 +43,32 @@ class LibraryApiTest {
 	private MockMvc mockMvc;
 
 	@Autowired
-	private SqlSession sqlSession;
+	private LoanDao loanDao;
 
 	@Autowired
-	private MeterRegistry meterRegistry;
+	private MemberDao memberDao;
+
+	@Autowired
+	private InMemoryBorrowingRules borrowingRules;
+
+	@BeforeEach
+	void resetBorrowingRules() {
+		borrowingRules.replace(new BorrowingProperties(5, true, 14));
+	}
 
 	@Test
 	void healthChecksProcessDatabaseAndDisk() throws Exception {
-		mockMvc.perform(get("/actuator/health"))
+		mockMvc.perform(get("/actuator/health/liveness"))
 				.andExpect(status().isOk())
-				.andExpect(jsonPath("$.status").value("UP"))
-				.andExpect(jsonPath("$.components.ping.status").value("UP"))
-				.andExpect(jsonPath("$.components.db.status").value("UP"))
-				.andExpect(jsonPath("$.components.diskSpace.status").value("UP"));
+				.andExpect(jsonPath("$.healthy").value(true))
+				.andExpect(jsonPath("$.databaseCheck").doesNotExist())
+				.andExpect(jsonPath("$.diskCheck").doesNotExist());
+
+		mockMvc.perform(get("/actuator/health/readiness"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.healthy").value(true))
+				.andExpect(jsonPath("$.databaseCheck").value(true))
+				.andExpect(jsonPath("$.diskCheck").value(true));
 	}
 
 	@Test
@@ -97,10 +116,19 @@ class LibraryApiTest {
 		mockMvc.perform(delete("/api/v1/books/" + bookId).with(librarian()))
 				.andExpect(status().isNoContent());
 
-		mockMvc.perform(get("/api/v1/borrow-history").with(librarian()))
+		Member seeded = memberDao.findMemberByEmail("member@library.local").orElseThrow();
+		mockMvc.perform(get("/api/v1/borrow-history").with(librarian()).param("memberId", String.valueOf(seeded.getId())))
 				.andExpect(status().isOk())
 				.andExpect(jsonPath("$.content").isArray());
-		mockMvc.perform(get("/api/v1/borrow-history").with(member()))
+		mockMvc.perform(get("/api/v1/borrow-history").with(librarian()))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value("invalid member id"));
+		mockMvc.perform(get("/api/v1/borrow-history").with(librarian()).param("memberId", "999999"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value("invalid member id"));
+		mockMvc.perform(get("/api/v1/borrow-history").with(member()).param("memberId", String.valueOf(seeded.getId())))
+				.andExpect(status().isOk());
+		mockMvc.perform(get("/api/v1/borrow-history").with(member()).param("memberId", "999999"))
 				.andExpect(status().isForbidden());
 	}
 
@@ -119,7 +147,7 @@ class LibraryApiTest {
 
 	@Test
 	void memberBorrowsAndReturnsOnlyForSelf() throws Exception {
-		Member seeded = sqlSession.findMemberByEmail("member@library.local").orElseThrow();
+		Member seeded = memberDao.findMemberByEmail("member@library.local").orElseThrow();
 		long otherMemberId = createMember(email());
 		long bookId = createBook(isbn(), 2);
 
@@ -134,25 +162,33 @@ class LibraryApiTest {
 				.andExpect(status().isCreated())
 				.andExpect(jsonPath("$.returnedAt").isEmpty())
 				.andReturn();
-		Instant dueDate = Instant.parse(JsonPath.read(borrowed.getResponse().getContentAsString(), "$.dueDate"));
+		Instant dueDate = Instant.from(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC)
+				.parse(JsonPath.read(borrowed.getResponse().getContentAsString(), "$.dueDate")));
 		assertThat(dueDate).isAfter(Instant.now().plus(13, ChronoUnit.DAYS));
-		long loanId = idOf(borrowed);
 
 		mockMvc.perform(get("/api/v1/books/" + bookId).with(member()))
 				.andExpect(jsonPath("$.availableCopies").value(1));
 
-		mockMvc.perform(post("/api/v1/loans/" + loanId + "/return").with(member()))
+		mockMvc.perform(post("/api/v1/loans/return").with(member())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(loanJson(seeded.getId(), bookId)))
 				.andExpect(status().isOk())
 				.andExpect(jsonPath("$.returnedAt").isNotEmpty());
-		mockMvc.perform(post("/api/v1/loans/" + loanId + "/return").with(member()))
+		mockMvc.perform(post("/api/v1/loans/return").with(member())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(loanJson(seeded.getId(), bookId)))
 				.andExpect(status().isOk())
 				.andExpect(jsonPath("$.returnedAt").isNotEmpty());
 		mockMvc.perform(get("/api/v1/books/" + bookId).with(member()))
 				.andExpect(jsonPath("$.availableCopies").value(2));
 
-		assertThat(meterRegistry.get("library.loans.borrowed").counter().count()).isPositive();
-		assertThat(meterRegistry.get("library.loans.returned").counter().count()).isPositive();
-		assertThat(meterRegistry.find("http.server.requests").tag("uri", "/api/v1/loans").timers()).isNotEmpty();
+		MvcResult metrics = mockMvc.perform(get("/api/v1/metrics").with(member()))
+				.andExpect(status().isOk())
+				.andReturn();
+		assertThat(((Number) JsonPath.read(metrics.getResponse().getContentAsString(), "$.loansBorrowed")).longValue())
+				.isPositive();
+		assertThat(((Number) JsonPath.read(metrics.getResponse().getContentAsString(), "$.loansReturned")).longValue())
+				.isPositive();
 	}
 
 	@Test
@@ -187,7 +223,15 @@ class LibraryApiTest {
 				.andExpect(status().isConflict())
 				.andExpect(jsonPath("$.code").value("NO_COPIES_AVAILABLE"));
 
-		assertThat(meterRegistry.get("library.loans.rejected").tag("code", "LOAN_LIMIT_REACHED").counter().count()).isPositive();
+		MvcResult metrics = mockMvc.perform(get("/api/v1/metrics").with(librarian()))
+				.andExpect(status().isOk())
+				.andReturn();
+		var rejected = JsonPath.<java.util.List<java.util.Map<String, Object>>>read(
+				metrics.getResponse().getContentAsString(), "$.loansRejected");
+		assertThat(rejected.stream()
+				.anyMatch(row -> "LOAN_LIMIT_REACHED".equals(row.get("code"))
+						&& ((Number) row.get("count")).longValue() > 0))
+				.isTrue();
 	}
 
 	@Test
@@ -197,9 +241,9 @@ class LibraryApiTest {
 		long secondBook = createBook(isbn(), 1);
 		long loanId = borrow(memberId, firstBook);
 
-		var loan = sqlSession.findLoan(loanId).orElseThrow();
+		var loan = loanDao.findLoan(loanId).orElseThrow();
 		loan.setDueDate(Instant.now().minus(1, ChronoUnit.DAYS));
-		sqlSession.save(loan);
+		loanDao.save(loan);
 
 		mockMvc.perform(post("/api/v1/loans").with(librarian())
 						.contentType(MediaType.APPLICATION_JSON)
@@ -219,6 +263,39 @@ class LibraryApiTest {
 	}
 
 	@Test
+	void apiMetricsTrackHttpStatusAndLatency() throws Exception {
+		mockMvc.perform(get("/api/v1/books").with(librarian()).param("size", "0"))
+				.andExpect(status().isBadRequest());
+
+		mockMvc.perform(get("/api/v1/metrics").with(librarian()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.httpResponses").isArray())
+				.andExpect(jsonPath("$.apiRequestDuration.sampleCount").isNumber())
+				.andExpect(jsonPath("$.apiRequestDuration.averageMs").isNumber());
+	}
+
+	@Test
+	void duplicateIsbnAndEmailAreRejected() throws Exception {
+		String isbn = isbn();
+		createBook(isbn, 1);
+		mockMvc.perform(post("/api/v1/books").with(librarian())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(bookJson(isbn, 1)))
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.code").value("ISBN_ALREADY_EXISTS"));
+
+		String email = email();
+		createMember(email);
+		mockMvc.perform(post("/api/v1/members").with(librarian())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("""
+								{"name":"Duplicate","email":"%s","password":"MemberPass!26"}
+								""".formatted(email)))
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.code").value("EMAIL_ALREADY_EXISTS"));
+	}
+
+	@Test
 	void memberCanReadRulesButNotAnotherMember() throws Exception {
 		long otherMemberId = createMember(email());
 		mockMvc.perform(get("/api/v1/members/" + otherMemberId).with(member()))
@@ -229,6 +306,21 @@ class LibraryApiTest {
 				.andExpect(jsonPath("$.maxActiveLoans").value(5))
 				.andExpect(jsonPath("$.blockWhenOverdue").value(true))
 				.andExpect(jsonPath("$.loanDurationDays").value(14));
+
+		mockMvc.perform(put("/api/v1/borrowing-rules").with(librarian())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("""
+								{"maxActiveLoans":6,"blockWhenOverdue":true,"loanDurationDays":21}
+								"""))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.maxActiveLoans").value(6))
+				.andExpect(jsonPath("$.loanDurationDays").value(21));
+		mockMvc.perform(put("/api/v1/borrowing-rules").with(member())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("""
+								{"maxActiveLoans":6,"blockWhenOverdue":true,"loanDurationDays":21}
+								"""))
+				.andExpect(status().isForbidden());
 	}
 
 	private long createBook(String isbn, int copies) throws Exception {
@@ -241,11 +333,15 @@ class LibraryApiTest {
 	}
 
 	private long createMember(String email) throws Exception {
+		return createMember(email, "MemberPass!26");
+	}
+
+	private long createMember(String email, String password) throws Exception {
 		MvcResult result = mockMvc.perform(post("/api/v1/members").with(librarian())
 						.contentType(MediaType.APPLICATION_JSON)
 						.content("""
-								{"name":"Test Member","email":"%s"}
-								""".formatted(email)))
+								{"name":"Test Member","email":"%s","password":"%s"}
+								""".formatted(email, password)))
 				.andExpect(status().isCreated())
 				.andReturn();
 		return idOf(result);
@@ -285,11 +381,11 @@ class LibraryApiTest {
 	}
 
 	private static RequestPostProcessor librarian() {
-		return httpBasic("librarian", "password");
+		return httpBasic("librarian", "DeskAdmin!26");
 	}
 
 	private static RequestPostProcessor member() {
-		return httpBasic("member", "password");
+		return httpBasic("member@library.local", "BorrowSelf!26");
 	}
 
 }

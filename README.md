@@ -9,20 +9,23 @@ A secured Java microservice for a library desk. It manages the book catalog, reg
 - Catalog of books, with a unique ISBN and a count of copies still on the shelf.
 - Member records, with a unique email.
 - Borrow and return, including a full borrow history for the librarian.
-- Configurable rules: maximum active loans, block when overdue, and loan duration.
+- Configurable borrowing rules in memory (librarian can update at runtime; defaults from `application.properties` on startup).
 - HTTP Basic authentication with two predefined roles.
 - Request validation, centralized error responses, health checks, metrics, and request ids.
-- PostgreSQL persistence, with the schema in `src/main/resources/schema.sql`.
+- PostgreSQL persistence. Tables are created from `src/main/resources/schema.sql` on startup (see **Database schema**).
+- HikariCP connection pooling for PostgreSQL access.
+- Persistence: `com.library.session.SqlSession` (save, find, delete, Hibernate `session()`) and `com.library.dao` classes (`BookDao`, `MemberDao`, `LoanDao`, `HealthDao`, `MetricDao`), each injecting `SqlSession` and owning its queries.
+- Borrow eligibility checks live in `com.library.rules` (`BorrowingRules`, `BorrowingContext`, `RuleResult`).
 - Swagger UI and automated tests.
 
 ## 3. Roles allowed
 
 | Role | Username | Password | Allowed operations |
 |---|---|---|---|
-| `LIBRARIAN` | `librarian` | `password` | Manage books and members, view all loans and borrow history, borrow and return for any member |
-| `MEMBER` | `member` | `password` | Read the catalog and the borrowing rules, and borrow, return, and read only their own loans |
+| `LIBRARIAN` | `librarian` | `DeskAdmin!26` | Manage books and members, view all loans and borrow history, borrow and return for any member |
+| `MEMBER` | member **email** (e.g. `member@library.local`) | password set at registration | Read the catalog and the borrowing rules, and borrow, return, and read only their own loans |
 
-The member login is linked to `member@library.local` (Ada Lovelace). A member name is not a username.
+The sample member `member@library.local` (Ada Lovelace) is seeded with password from `library.seed.member-password` (default `BorrowSelf!26`). New members choose a password when the librarian registers them; they sign in with **email + password**, not a separate username.
 
 ## 4. Data model
 
@@ -52,9 +55,9 @@ The member login is linked to `member@library.local` (Ada Lovelace). A member na
 | `id` | number | Primary key |
 | `bookId` | number | Foreign key to Book |
 | `memberId` | number | Foreign key to Member |
-| `borrowedAt` | string | Borrow time, ISO-8601 UTC |
-| `dueDate` | string | Due time, calculated from the configured duration |
-| `returnedAt` | string or null | Return time. `null` while the loan is open |
+| `borrowedAt` | string | Borrow time, UTC, `yyyy-MM-dd HH:mm:ss` |
+| `dueDate` | string | Due time, UTC, same format |
+| `returnedAt` | string or null | Return time, same format. `null` while the loan is open |
 
 ## 5. Technical stack
 
@@ -66,11 +69,49 @@ The member login is linked to `member@library.local` (Ada Lovelace). A member na
 - HikariCP connection pool
 - BCrypt password hashing
 - springdoc OpenAPI / Swagger UI
-- Micrometer and Spring Boot Actuator
+- Spring Boot Actuator (health only); loan metrics in PostgreSQL
 
-## 6. Getting started
+## 6. Prerequisites
 
-Java 17 or newer and PostgreSQL are required.
+| Dependency | Version | Purpose |
+|---|---|---|
+| Java JDK | 17 or newer | Build and run the service |
+| PostgreSQL | 14+ (16 recommended) | Books, members, and loans |
+| Maven | Optional | The project includes `./mvnw` |
+
+Connection pooling uses **HikariCP** (via Spring Boot). Defaults are in `application.properties`: maximum pool size 10, minimum idle 2, connection timeout 30 seconds.
+
+## 7. Database schema
+
+Hibernate is set to `spring.jpa.hibernate.ddl-auto=validate`, so it does **not** create tables by itself. On every startup, Spring runs `src/main/resources/schema.sql` because `spring.sql.init.mode=always`. That script uses `CREATE TABLE IF NOT EXISTS`, so existing databases are left intact.
+
+| Table | Purpose |
+|---|---|
+| `books` | Catalog; unique `isbn`; `total_copies` and `available_copies` |
+| `members` | Registered members; unique `email`; `password_hash` (BCrypt) for HTTP Basic login |
+| `loans` | Borrow and return history; foreign keys to `members` and `books` |
+| `library_metric_counters` | Cumulative loan event counts (`borrowed`, `returned`, `rejected` with rule `code`) |
+| `library_metric_timers` | Running totals for borrow duration (`library.loans.borrow`) |
+
+Borrowing rules are **not** stored in the database. They live in memory for the running process (see section 10).
+
+## 8. Getting started
+
+### Option A — Docker Compose (PostgreSQL + service)
+
+Requires Docker and Docker Compose.
+
+```bash
+git clone https://github.com/abhisheknetradyne/Book-Lending-Microservice.git
+cd Book-Lending-Microservice
+docker compose up --build
+```
+
+Wait until the app log shows `Started LibraryServiceApplication`. The API is at http://localhost:8098. PostgreSQL is exposed on port 5432 with user `library`, password `library`, database `library`.
+
+### Option B — Local PostgreSQL and Maven
+
+Create databases once:
 
 ```sql
 CREATE USER library WITH PASSWORD 'library';
@@ -78,9 +119,10 @@ CREATE DATABASE library OWNER library;
 CREATE DATABASE library_test OWNER library;
 ```
 
+Start PostgreSQL, then from the project root (Java 17 on your `PATH`):
+
 ```bash
-git clone https://github.com/abhisheknetradyne/Book-Lending-Microservice.git
-cd Book-Lending-Microservice
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)   # macOS example
 ./mvnw spring-boot:run
 ```
 
@@ -90,32 +132,35 @@ The service listens on http://localhost:8098. On startup it applies `schema.sql`
 |---|---|
 | Swagger UI | http://localhost:8098/swagger-ui.html |
 | OpenAPI JSON | http://localhost:8098/v3/api-docs |
-| Health | http://localhost:8098/actuator/health |
+| Liveness | http://localhost:8098/actuator/health/liveness |
+| Readiness | http://localhost:8098/actuator/health/readiness |
 
-In Swagger, choose **Authorize** and enter `librarian` / `password` or `member` / `password`.
+In Swagger, choose **Authorize** and enter `librarian` / `DeskAdmin!26` or a member email / that member's password (e.g. `member@library.local` / `BorrowSelf!26` for the seed account).
 
-Tests use the `library_test` database:
+Tests use the `library_test` database (same user and password):
 
 ```bash
 ./mvnw test
 ```
 
-## 7. Security
+## 9. Security
 
 - Use HTTPS outside local development.
 - Every `/api/v1` call requires HTTP Basic credentials. Health is public.
 - Passwords in `application-security.properties` are hashed with BCrypt when the process starts.
 - A member can act only on the member row linked to their login.
 
-## 8. Borrowing rules
+## 10. Borrowing rules
 
-These values are in `application.properties`. They are not stored in the database. Change them and restart the service.
+Defaults are loaded from `application.properties` when the process starts:
 
 ```properties
 library.borrowing.max-active-loans=5
 library.borrowing.block-when-overdue=true
 library.borrowing.loan-duration-days=14
 ```
+
+A librarian can change the active rules in memory with `PUT /api/v1/borrowing-rules` (same JSON shape as the GET response). Changes apply to new borrows in this process only and are **lost on restart** unless you also update `application.properties` or redeploy with new config.
 
 On each borrow, the service locks the book row and then checks, in order:
 
@@ -126,22 +171,55 @@ On each borrow, the service locks the book row and then checks, in order:
 
 The due date is the borrow time plus `loan-duration-days`. A loan that already exists keeps its original due date.
 
-## 9. Observability
+## 11. Observability
 
-Each API response includes `X-Request-Id`. The same id is written on the log line for that call. Logs go to the terminal and to `logs/library-service.log`.
+Each API response includes `X-Request-Id`. The same id is written on the log line for that call. Logs go to the terminal and to `logs/library-service.log`. Default level for `com.library` is **INFO** (`application-logging.properties`).
 
-`GET /actuator/health` is up only when the process, the database, and disk space are up.
+### Logging (what you see per call)
 
-| Metric | Description |
+| Source | Level | When |
+|---|---|---|
+| `RequestIdFilter` | INFO | Every `/api/*` request when it finishes: `method`, `path`, `status` |
+| `ApiExceptionHandler` | WARN | Validation failures (field list), 4xx API errors (`code`, `message`, `path`) |
+| `ApiExceptionHandler` | ERROR | 5xx and unexpected exceptions (stack trace) |
+| Service layer (`*ServiceImpl`) | INFO | Mutations started and succeeded (book/member/loan/rules) |
+| Service layer | WARN | Business failures before throw (not found, conflict, borrow rejected, invalid member) |
+| `LoanServiceImpl` | INFO | Borrow/return lifecycle (including idempotent return) |
+| `HealthServiceImpl` | INFO / ERROR | Readiness checks (same as before) |
+| `DataSeeder` | INFO | One-time seed messages at startup |
+
+Every log line for an API call includes the request id from MDC when the filter has set it.
+
+### Metrics (PostgreSQL, not logs)
+
+Every **`/api/*`** request (when the filter finishes) records:
+
+- **HTTP status** — counter `library.api.responses` keyed by status code (`200`, `400`, `409`, …)
+- **End-to-end latency** — timer `library.api.request` (receive → response complete, milliseconds)
+
+Loan-specific counters are updated inside loan services as before:
+
+| API | Loan metrics written |
 |---|---|
-| `library.loans.borrowed` | Loans created |
-| `library.loans.returned` | Books returned |
-| `library.loans.rejected` | Refusals, tagged with the rule code |
-| `library.loans.active` | Open loans |
-| `library.loans.borrow` | Time spent inside borrow |
-| `http.server.requests` | Latency of each API path |
+| `POST /api/v1/loans` (success) | `library.loans.borrowed` +1; `library.loans.borrow` timer (service handling ms) |
+| `POST /api/v1/loans` (rule rejection) | `library.loans.rejected` +1 for that rule `code` (persists even though the borrow transaction rolls back) |
+| `POST /api/v1/loans/return` (return processed) | `library.loans.returned` +1 |
 
-## 10. API details
+`GET /actuator/health/liveness` checks that the process is running. `GET /actuator/health/readiness` runs `SELECT 1` against PostgreSQL and checks free disk space.
+
+Loan metrics are **stored in PostgreSQL** (`library_metric_counters`, `library_metric_timers`). Open loans are counted from the `loans` table. Read them with **`GET /api/v1/metrics`** (any signed-in user).
+
+| Response field | Description |
+|---|---|
+| `loansBorrowed` | Successful borrows since the database was created |
+| `loansReturned` | Returns recorded in metrics |
+| `loansActive` | Open loans (`returned_at` is null) |
+| `loansRejected` | Borrow refusals, each with `code` and `count` |
+| `borrowDuration` | `sampleCount` and `averageMs` for successful borrow handling |
+| `httpResponses` | API responses by HTTP `status` and `count` |
+| `apiRequestDuration` | `sampleCount` and `averageMs` for full `/api/*` request latency |
+
+## 12. API details
 
 All application APIs are under `/api/v1` and use JSON.
 
@@ -156,7 +234,7 @@ All application APIs are under `/api/v1` and use JSON.
 
 ```json
 {
-  "timestamp": "2026-10-19T01:30:00Z",
+  "timestamp": "2026-10-19 01:30:00",
   "path": "/api/v1/loans",
   "code": "VALIDATION_FAILED",
   "message": "Request validation failed",
@@ -171,7 +249,7 @@ All application APIs are under `/api/v1` and use JSON.
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | string | UTC time of the error |
+| `timestamp` | string | UTC, `yyyy-MM-dd HH:mm:ss` |
 | `path` | string | Request path |
 | `code` | string | Stable error code |
 | `message` | string | Human-readable message |
@@ -314,17 +392,19 @@ List members. Librarian only.
 
 ### `POST /api/v1/members`
 
-Register a member. Librarian only. This creates a member record. It does not create a login.
+Register a member. Librarian only. Creates the member record and a login (HTTP Basic: **email** + **password**).
 
 | Field | In | Type | Mandatory | Validation |
 |---|---|---|---|---|
 | `name` | body | string | Yes | Not blank, maximum 200 characters |
 | `email` | body | string | Yes | Valid email, maximum 200 characters, unique ignoring case |
+| `password` | body | string | Yes | 8–72 characters (stored as BCrypt hash) |
 
 ```json
 {
   "name": "Grace Hopper",
-  "email": "grace@library.local"
+  "email": "grace@library.local",
+  "password": "GraceReads!26"
 }
 ```
 
@@ -386,8 +466,8 @@ Borrow one copy. A member may borrow only for their own member id. A librarian m
   "id": 10,
   "bookId": 1,
   "memberId": 1,
-  "borrowedAt": "2026-10-19T01:30:00Z",
-  "dueDate": "2026-11-02T01:30:00Z",
+  "borrowedAt": "2026-10-19 01:30:00",
+  "dueDate": "2026-11-02 01:30:00",
   "returnedAt": null
 }
 ```
@@ -403,59 +483,43 @@ Borrow one copy. A member may borrow only for their own member id. A librarian m
 
 The 5 and the 14-day due date come from configuration. If two requests compete for the last copy, the book row is locked: one request returns 201 and the other returns 409 `NO_COPIES_AVAILABLE`.
 
-### `POST /api/v1/loans/{id}/return`
+### `POST /api/v1/loans/return`
 
-Return a book. A member may return only their own loan. A librarian may return any loan. Returning a loan that is already returned does not change it.
+Return a book. Send the same `memberId` and `bookId` used to borrow. A member may return only their own loan. A librarian may return any loan. Returning a loan that is already returned does not change it.
 
-| Parameter | In | Type | Mandatory | Description |
+| Field | In | Type | Mandatory | Validation |
 |---|---|---|---|---|
-| `id` | path | number | Yes | Positive loan id |
+| `memberId` | body | number | Yes | Positive, and the member must exist |
+| `bookId` | body | number | Yes | Positive, and the book must exist |
 
-**Request body:** none.
+```json
+{
+  "memberId": 1,
+  "bookId": 1
+}
+```
 
 **Success — 200:** the loan, with `returnedAt` set. A second return returns the same loan and still 200.
 
 **Failure:** 400, 401, 403, 404.
 
-### `GET /api/v1/loans`
+### `GET /api/v1/borrow-history`
 
-List loans. A librarian can list every loan or filter by member. A member always receives only their own loans.
+Borrowing history for one member, including returned loans. `memberId` is required. A librarian can read any member. A member can read only their own.
 
 | Parameter | In | Type | Mandatory | Description |
 |---|---|---|---|---|
-| `memberId` | query | number | No | Positive member id. A member cannot ask for another member |
+| `memberId` | query | number | Yes | Member id. Missing or unknown ids return 400 `INVALID_MEMBER` |
 | `page` | query | number | No | Page, default 0 |
 | `size` | query | number | No | Page size, default 20 |
 
-**Success — 200:** a page of loan objects.
-
-**Failure:** 400, 401. 403 when a member requests another member's loans.
-
-### `GET /api/v1/loans/{id}`
-
-One loan. A librarian can read any loan. A member can read only their own.
-
-| Parameter | In | Type | Mandatory | Description |
-|---|---|---|---|---|
-| `id` | path | number | Yes | Positive loan id |
-
-**Success — 200:** one loan object.
-
-**Failure:** 400, 401, 403, 404.
-
-### `GET /api/v1/borrow-history`
-
-Every borrow and return record. Librarian only.
-
-**Query parameters:** `page`, `size`.
-
 **Success — 200:** a page of loan objects, including returned loans.
 
-**Failure:** 400, 401, 403.
+**Failure:** 400 `INVALID_MEMBER` with message `invalid member id`. 401. 403 when a member requests another member's loans.
 
 ### `GET /api/v1/borrowing-rules`
 
-The rules currently loaded from `application.properties`. Any signed-in user. No parameters.
+The rules currently active in this process. Any signed-in user.
 
 **Success — 200**
 
@@ -469,28 +533,89 @@ The rules currently loaded from `application.properties`. Any signed-in user. No
 
 **Failure:** 401 `UNAUTHORIZED`.
 
-### `GET /actuator/health`
+### `PUT /api/v1/borrowing-rules`
 
-Public. No parameters and no body.
+Update borrowing rules in memory. Librarian only. Restart restores defaults from `application.properties` unless that file was changed too.
 
-**Success — 200:** status `UP`, with `ping`, `db`, and `diskSpace` components.
-
-**Failure — 503:** status `DOWN` when one of those checks fails.
-
-### `GET /actuator/metrics` and `GET /actuator/metrics/{metricName}`
-
-Any signed-in user.
-
-| Parameter | In | Type | Mandatory | Description |
+| Field | In | Type | Mandatory | Validation |
 |---|---|---|---|---|
-| `metricName` | path | string | Yes, on the detail call | Metric name, such as `library.loans.borrowed` |
-| `tag` | query | string | No | Repeatable `key:value` filter |
+| `maxActiveLoans` | body | number | Yes | At least 1 |
+| `blockWhenOverdue` | body | boolean | Yes | |
+| `loanDurationDays` | body | number | Yes | At least 1 |
 
-**Success — 200:** Actuator metric JSON.
+**Success — 200:** the updated rules (same shape as GET).
 
-**Failure:** 401. 404 when the metric name does not exist.
+**Failure:** 400, 401, 403.
 
-## 11. Edge cases
+### `GET /actuator/health/liveness`
+
+Public. No parameters and no body. This only checks that the process answered. It does not call the database.
+
+**Success — 200**
+
+```json
+{
+  "healthy": true
+}
+```
+
+**Failure:** no JSON if the process is down. The connection is refused.
+
+### `GET /actuator/health/readiness`
+
+Public. No parameters and no body. Ready means PostgreSQL answered `SELECT 1` and free disk space is at least 10 MB. `healthy` is true only when both checks passed.
+
+**Success — 200**
+
+```json
+{
+  "healthy": true,
+  "databaseCheck": true,
+  "diskCheck": true
+}
+```
+
+**Failure — 503:** the same shape, with `healthy` false and the failed check false.
+
+| Field | Type | Description |
+|---|---|---|
+| `healthy` | boolean | True when every check in that response passed |
+| `databaseCheck` | boolean | True when `SELECT 1` succeeded. Readiness only |
+| `diskCheck` | boolean | True when free disk space is at least 10 MB. Readiness only |
+
+### `GET /api/v1/metrics`
+
+Loan counters and borrow timings from PostgreSQL. Any signed-in user.
+
+**Success — 200**
+
+```json
+{
+  "loansBorrowed": 12,
+  "loansReturned": 8,
+  "loansActive": 4,
+  "loansRejected": [
+    { "code": "LOAN_LIMIT_REACHED", "count": 2 }
+  ],
+  "borrowDuration": {
+    "sampleCount": 12,
+    "averageMs": 45.5
+  },
+  "httpResponses": [
+    { "status": 200, "count": 840 },
+    { "status": 400, "count": 12 },
+    { "status": 409, "count": 5 }
+  ],
+  "apiRequestDuration": {
+    "sampleCount": 857,
+    "averageMs": 18.2
+  }
+}
+```
+
+**Failure:** 401.
+
+## 13. Edge cases
 
 | Case | Result |
 |---|---|

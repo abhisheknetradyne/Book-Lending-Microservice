@@ -9,10 +9,8 @@ public interface LoanService {
 
 	LoanResponse borrow(LoanRequest request);
 
-	LoanResponse returnBook(Long loanId);
+	LoanResponse returnBook(LoanRequest request);
 
-	LoanResponse get(Long loanId);
-
-	Page<LoanResponse> list(Long memberId, int page, int size);
+	Page<LoanResponse> borrowingHistory(Long memberId, int page, int size);
 
 }

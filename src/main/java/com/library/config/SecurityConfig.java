@@ -18,6 +18,9 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 
+import com.library.dao.MemberDao;
+import com.library.entity.Member;
+
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -32,16 +35,17 @@ public class SecurityConfig {
 				.csrf(AbstractHttpConfigurer::disable)
 				.sessionManagement(sessions -> sessions.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 				.authorizeHttpRequests(auth -> auth
-						.requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+						.requestMatchers("/actuator/health/liveness", "/actuator/health/readiness").permitAll()
 						.requestMatchers("/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs", "/v3/api-docs/**").permitAll()
 						.requestMatchers(HttpMethod.GET, "/api/v1/books", "/api/v1/books/**").authenticated()
 						.requestMatchers("/api/v1/books", "/api/v1/books/**").hasRole(LIBRARIAN)
 						.requestMatchers(HttpMethod.GET, "/api/v1/members/*").authenticated()
 						.requestMatchers("/api/v1/members", "/api/v1/members/**").hasRole(LIBRARIAN)
-						.requestMatchers(HttpMethod.GET, "/api/v1/borrow-history").hasRole(LIBRARIAN)
+						.requestMatchers(HttpMethod.GET, "/api/v1/borrow-history").authenticated()
 						.requestMatchers(HttpMethod.GET, "/api/v1/borrowing-rules").authenticated()
+						.requestMatchers(HttpMethod.PUT, "/api/v1/borrowing-rules").hasRole(LIBRARIAN)
 						.requestMatchers("/api/v1/loans", "/api/v1/loans/**").authenticated()
-						.requestMatchers("/actuator/metrics", "/actuator/metrics/**").authenticated()
+						.requestMatchers("/api/v1/metrics", "/api/v1/metrics/**").authenticated()
 						.anyRequest().authenticated())
 				.httpBasic(Customizer.withDefaults())
 				.exceptionHandling(errors -> errors
@@ -51,16 +55,21 @@ public class SecurityConfig {
 	}
 
 	@Bean
-	UserDetailsService users(SecurityUsersProperties properties, PasswordEncoder encoder) {
-		Map<String, LibraryUser> accounts = properties.users().stream()
+	UserDetailsService users(SecurityUsersProperties properties, MemberDao members, PasswordEncoder encoder) {
+		Map<String, LibraryUser> staffAccounts = properties.users().stream()
 				.map(user -> new LibraryUser(user.username(), encoder.encode(user.password()), user.roles(), user.memberEmail()))
 				.collect(Collectors.toMap(user -> user.getUsername().toLowerCase(), Function.identity()));
 		return username -> {
-			LibraryUser user = accounts.get(username.toLowerCase());
-			if (user == null) {
+			LibraryUser staff = staffAccounts.get(username.toLowerCase());
+			if (staff != null) {
+				return staff;
+			}
+			Member member = members.findMemberByEmail(username)
+					.orElseThrow(() -> new UsernameNotFoundException(username));
+			if (member.missingLoginPassword()) {
 				throw new UsernameNotFoundException(username);
 			}
-			return user;
+			return new LibraryUser(member.getEmail(), member.getPasswordHash(), "MEMBER", member.getEmail());
 		};
 	}
 
@@ -76,7 +85,7 @@ public class SecurityConfig {
 		response.setCharacterEncoding("UTF-8");
 		response.getWriter().write("""
 				{"timestamp":"%s","path":"%s","code":"%s","message":"%s","fieldErrors":[]}
-				""".formatted(Instant.now(), escape(request.getRequestURI()), code, message));
+				""".formatted(Timestamps.format(Instant.now()), escape(request.getRequestURI()), code, message));
 	}
 
 	private static String escape(String value) {

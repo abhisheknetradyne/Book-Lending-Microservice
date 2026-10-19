@@ -17,7 +17,7 @@ import jakarta.validation.constraints.Min;
 
 @RestController
 @RequestMapping("/api/v1/borrow-history")
-@Tag(name = "Borrow history", description = "Complete borrow and return history for librarians")
+@Tag(name = "Borrow history", description = "Borrow and return history for one member")
 @SecurityRequirement(name = "basicAuth")
 public class BorrowHistoryController {
 
@@ -28,11 +28,12 @@ public class BorrowHistoryController {
 	}
 
 	@GetMapping
-	@Operation(summary = "View all borrow records", description = "Librarian only")
-	public PageResponse<LoanResponse> list(
+	@Operation(operationId = "borrowingHistory", summary = "Borrowing history", description = "Loans for one member, including returned books. memberId is required. A librarian can read any member. A member can read only their own.")
+	public PageResponse<LoanResponse> borrowingHistory(
+			@RequestParam(required = false) Long memberId,
 			@RequestParam(defaultValue = "0") @Min(0) int page,
 			@RequestParam(defaultValue = "20") @Min(1) @Max(100) int size) {
-		return PageResponse.from(loans.list(null, page, size));
+		return PageResponse.from(loans.borrowingHistory(memberId, page, size));
 	}
 
 }
