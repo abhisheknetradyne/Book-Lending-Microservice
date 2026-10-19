@@ -23,9 +23,9 @@ A secured Java microservice for a library desk. It manages the book catalog, reg
 | Role | Username | Password | Allowed operations |
 |---|---|---|---|
 | `LIBRARIAN` | `librarian` | `DeskAdmin!26` | Manage books and members, view all loans and borrow history, borrow and return for any member |
-| `MEMBER` | member **email** (e.g. `member@library.local`) | password set at registration | Read the catalog and the borrowing rules, and borrow, return, and read only their own loans |
+| `MEMBER` | `member@library.local` (sample login; use the member's **email** for others) | `BorrowSelf!26` (sample account; new members use the password chosen at registration) | Read the catalog and the borrowing rules, and borrow, return, and read only their own loans |
 
-The sample member `member@library.local` (Ada Lovelace) is seeded with password from `library.seed.member-password` (default `BorrowSelf!26`). New members choose a password when the librarian registers them; they sign in with **email + password**, not a separate username.
+The sample member is Ada Lovelace at `member@library.local` with password **`BorrowSelf!26`** (from `library.seed.member-password` on startup). When a librarian registers another member, that person signs in with their **email + password** from `POST /api/v1/members`.
 
 ## 4. Data model
 
