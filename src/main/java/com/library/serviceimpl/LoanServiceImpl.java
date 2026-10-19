@@ -10,7 +10,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import com.library.config.InMemoryBorrowingRules;
 import com.library.dao.BookDao;
 import com.library.dao.LoanDao;
 import com.library.dao.MemberDao;
@@ -26,6 +25,7 @@ import com.library.exception.BadRequestException;
 import com.library.exception.ConflictException;
 import com.library.exception.ForbiddenException;
 import com.library.exception.NotFoundException;
+import com.library.config.BorrowingProperties;
 import com.library.service.CurrentUser;
 import com.library.service.LoanService;
 import com.library.service.MetricsService;
@@ -38,18 +38,18 @@ public class LoanServiceImpl implements LoanService {
 	private final MemberDao members;
 	private final BookDao books;
 	private final LoanDao loans;
-	private final InMemoryBorrowingRules borrowingRulesConfig;
+	private final BorrowingProperties borrowingProperties;
 	private final BorrowingRules borrowingRules;
 	private final CurrentUser currentUser;
 	private final Clock clock;
 	private final MetricsService metrics;
 
-	public LoanServiceImpl(MemberDao members, BookDao books, LoanDao loans, InMemoryBorrowingRules borrowingRulesConfig,
+	public LoanServiceImpl(MemberDao members, BookDao books, LoanDao loans, BorrowingProperties borrowingProperties,
 			BorrowingRules borrowingRules, CurrentUser currentUser, Clock clock, MetricsService metrics) {
 		this.members = members;
 		this.books = books;
 		this.loans = loans;
-		this.borrowingRulesConfig = borrowingRulesConfig;
+		this.borrowingProperties = borrowingProperties;
 		this.borrowingRules = borrowingRules;
 		this.currentUser = currentUser;
 		this.clock = clock;
@@ -73,7 +73,7 @@ public class LoanServiceImpl implements LoanService {
 					return new NotFoundException("Book not found");
 				});
 		Instant now = clock.instant();
-		var rules = borrowingRulesConfig.current();
+		var rules = borrowingProperties;
 		BorrowingContext context = new BorrowingContext(member, book, loans.findOpenLoans(member.getId()), now, rules);
 		RuleResult result = borrowingRules.evaluate(context);
 		if (!result.allowed()) {

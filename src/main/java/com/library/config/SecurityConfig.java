@@ -43,7 +43,6 @@ public class SecurityConfig {
 						.requestMatchers("/api/v1/members", "/api/v1/members/**").hasRole(LIBRARIAN)
 						.requestMatchers(HttpMethod.GET, "/api/v1/borrow-history").authenticated()
 						.requestMatchers(HttpMethod.GET, "/api/v1/borrowing-rules").authenticated()
-						.requestMatchers(HttpMethod.PUT, "/api/v1/borrowing-rules").hasRole(LIBRARIAN)
 						.requestMatchers("/api/v1/loans", "/api/v1/loans/**").authenticated()
 						.requestMatchers("/api/v1/metrics", "/api/v1/metrics/**").authenticated()
 						.anyRequest().authenticated())

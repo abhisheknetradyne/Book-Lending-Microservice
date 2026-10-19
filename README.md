@@ -9,7 +9,7 @@ A secured Java microservice for a library desk. It manages the book catalog, reg
 - Catalog of books, with a unique ISBN and a count of copies still on the shelf.
 - Member records, with a unique email.
 - Borrow and return, including a full borrow history for the librarian.
-- Configurable borrowing rules in memory (librarian can update at runtime; defaults from `application.properties` on startup).
+- Configurable borrowing rules from `application.properties` (change config and redeploy to update).
 - HTTP Basic authentication with two predefined roles.
 - Request validation, centralized error responses, health checks, metrics, and request ids.
 - PostgreSQL persistence. Tables are created from `src/main/resources/schema.sql` on startup (see **Database schema**).
@@ -93,7 +93,7 @@ Hibernate is set to `spring.jpa.hibernate.ddl-auto=validate`, so it does **not**
 | `library_metric_counters` | Cumulative loan event counts (`borrowed`, `returned`, `rejected` with rule `code`) |
 | `library_metric_timers` | Running totals for borrow duration (`library.loans.borrow`) |
 
-Borrowing rules are **not** stored in the database. They live in memory for the running process (see section 10).
+Borrowing rules are **not** stored in the database. They are read from `application.properties` at startup (see section 10).
 
 ## 8. Getting started
 
@@ -152,7 +152,7 @@ Tests use the `library_test` database (same user and password):
 
 ## 10. Borrowing rules
 
-Defaults are loaded from `application.properties` when the process starts:
+Rules are defined in `application.properties` and loaded when the process starts. To change them, edit that file (or override the same keys via environment variables / deployment config) and **restart or redeploy** the service. There is no API to write rules at runtime.
 
 ```properties
 library.borrowing.max-active-loans=5
@@ -160,7 +160,7 @@ library.borrowing.block-when-overdue=true
 library.borrowing.loan-duration-days=14
 ```
 
-A librarian can change the active rules in memory with `PUT /api/v1/borrowing-rules` (same JSON shape as the GET response). Changes apply to new borrows in this process only and are **lost on restart** unless you also update `application.properties` or redeploy with new config.
+`GET /api/v1/borrowing-rules` exposes the active values for clients; it does not change configuration.
 
 On each borrow, the service locks the book row and then checks, in order:
 
@@ -182,7 +182,7 @@ Each API response includes `X-Request-Id`. The same id is written on the log lin
 | `RequestIdFilter` | INFO | Every `/api/*` request when it finishes: `method`, `path`, `status` |
 | `ApiExceptionHandler` | WARN | Validation failures (field list), 4xx API errors (`code`, `message`, `path`) |
 | `ApiExceptionHandler` | ERROR | 5xx and unexpected exceptions (stack trace) |
-| Service layer (`*ServiceImpl`) | INFO | Mutations started and succeeded (book/member/loan/rules) |
+| Service layer (`*ServiceImpl`) | INFO | Mutations started and succeeded (book/member/loan) |
 | Service layer | WARN | Business failures before throw (not found, conflict, borrow rejected, invalid member) |
 | `LoanServiceImpl` | INFO | Borrow/return lifecycle (including idempotent return) |
 | `HealthServiceImpl` | INFO / ERROR | Readiness checks (same as before) |
@@ -222,6 +222,10 @@ Loan metrics are **stored in PostgreSQL** (`library_metric_counters`, `library_m
 ## 12. API details
 
 All application APIs are under `/api/v1` and use JSON.
+
+### cURL
+
+Local base URL: `http://localhost:8098`. Use HTTP Basic auth with `-u 'username:password'`. Examples below use the seed librarian (`librarian` / `DeskAdmin!26`) unless the endpoint is member-specific; swap in `member@library.local` / `BorrowSelf!26` for member-only flows. Health endpoints need no credentials. Add `-i` to see response headers (including `X-Request-Id`).
 
 ### Common headers
 
@@ -280,6 +284,11 @@ List books. Any signed-in user.
 
 **Query parameters:** `page`, `size`.
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' \
+  'http://localhost:8098/api/v1/books?page=0&size=20'
+```
+
 **Success — 200**
 
 ```json
@@ -311,6 +320,11 @@ One book. Any signed-in user.
 |---|---|---|---|---|
 | `id` | path | number | Yes | Book id. Must be a positive whole number |
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' \
+  'http://localhost:8098/api/v1/books/1'
+```
+
 **Success — 200:** one book object, same fields as an item in the list above.
 
 **Failure:** 400 `MALFORMED_PARAMETER` or `VALIDATION_FAILED`. 401 `UNAUTHORIZED`. 404 `NOT_FOUND`.
@@ -335,6 +349,12 @@ Add a book. Librarian only.
 }
 ```
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' -X POST 'http://localhost:8098/api/v1/books' \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Effective Java","author":"Joshua Bloch","isbn":"9780134685991","totalCopies":2}'
+```
+
 **Success — 201:** the created book, including `id` and `availableCopies`.
 
 **Failure:** 400 `VALIDATION_FAILED` or `MALFORMED_REQUEST`. 401 `UNAUTHORIZED`. 403 `FORBIDDEN`. 409 `ISBN_ALREADY_EXISTS` or `DATA_CONFLICT`.
@@ -348,6 +368,12 @@ Replace the title, author, ISBN, and total copies. Librarian only. Total copies 
 | `id` | path | number | Yes | Positive book id |
 | body | body | object | Yes | Same fields and validation as `POST /api/v1/books` |
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' -X PUT 'http://localhost:8098/api/v1/books/1' \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Effective Java","author":"Joshua Bloch","isbn":"9780134685991","totalCopies":2}'
+```
+
 **Success — 200:** the updated book.
 
 **Failure:** 400, 401, 403, 404. 409 `ISBN_ALREADY_EXISTS`, `COPIES_BELOW_LOANS`, `CONCURRENT_UPDATE`, or `DATA_CONFLICT`.
@@ -360,6 +386,10 @@ Delete a book. Librarian only. Refused while any copy is on loan.
 |---|---|---|---|---|
 | `id` | path | number | Yes | Positive book id |
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' -X DELETE 'http://localhost:8098/api/v1/books/1'
+```
+
 **Success — 204:** empty body.
 
 **Failure:** 400, 401, 403, 404. 409 `BOOK_HAS_OPEN_LOANS`.
@@ -369,6 +399,11 @@ Delete a book. Librarian only. Refused while any copy is on loan.
 List members. Librarian only.
 
 **Query parameters:** `page`, `size`.
+
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' \
+  'http://localhost:8098/api/v1/members?page=0&size=20'
+```
 
 **Success — 200**
 
@@ -408,6 +443,12 @@ Register a member. Librarian only. Creates the member record and a login (HTTP B
 }
 ```
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' -X POST 'http://localhost:8098/api/v1/members' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Grace Hopper","email":"grace@library.local","password":"GraceReads!26"}'
+```
+
 **Success — 201:** the created member.
 
 **Failure:** 400, 401, 403. 409 `EMAIL_ALREADY_EXISTS` or `DATA_CONFLICT`.
@@ -419,6 +460,14 @@ A librarian can read any member. A member can read only their own record.
 | Parameter | In | Type | Mandatory | Description |
 |---|---|---|---|---|
 | `id` | path | number | Yes | Positive member id |
+
+```bash
+# Librarian — any member id
+curl -sS -u 'librarian:DeskAdmin!26' 'http://localhost:8098/api/v1/members/1'
+
+# Member — own id only
+curl -sS -u 'member@library.local:BorrowSelf!26' 'http://localhost:8098/api/v1/members/1'
+```
 
 **Success — 200:** one member object.
 
@@ -439,6 +488,12 @@ Change a member name. Librarian only. Email cannot be changed here.
 }
 ```
 
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' -X PATCH 'http://localhost:8098/api/v1/members/1' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Ada Lovelace"}'
+```
+
 **Success — 200:** the updated member.
 
 **Failure:** 400, 401, 403, 404.
@@ -457,6 +512,18 @@ Borrow one copy. A member may borrow only for their own member id. A librarian m
   "memberId": 1,
   "bookId": 1
 }
+```
+
+```bash
+# Member borrowing for themselves
+curl -sS -u 'member@library.local:BorrowSelf!26' -X POST 'http://localhost:8098/api/v1/loans' \
+  -H 'Content-Type: application/json' \
+  -d '{"memberId":1,"bookId":1}'
+
+# Librarian borrowing on behalf of a member
+curl -sS -u 'librarian:DeskAdmin!26' -X POST 'http://localhost:8098/api/v1/loans' \
+  -H 'Content-Type: application/json' \
+  -d '{"memberId":1,"bookId":1}'
 ```
 
 **Success — 201**
@@ -499,6 +566,12 @@ Return a book. Send the same `memberId` and `bookId` used to borrow. A member ma
 }
 ```
 
+```bash
+curl -sS -u 'member@library.local:BorrowSelf!26' -X POST 'http://localhost:8098/api/v1/loans/return' \
+  -H 'Content-Type: application/json' \
+  -d '{"memberId":1,"bookId":1}'
+```
+
 **Success — 200:** the loan, with `returnedAt` set. A second return returns the same loan and still 200.
 
 **Failure:** 400, 401, 403, 404.
@@ -513,13 +586,23 @@ Borrowing history for one member, including returned loans. `memberId` is requir
 | `page` | query | number | No | Page, default 0 |
 | `size` | query | number | No | Page size, default 20 |
 
+```bash
+curl -sS -u 'member@library.local:BorrowSelf!26' \
+  'http://localhost:8098/api/v1/borrow-history?memberId=1&page=0&size=20'
+```
+
 **Success — 200:** a page of loan objects, including returned loans.
 
 **Failure:** 400 `INVALID_MEMBER` with message `invalid member id`. 401. 403 when a member requests another member's loans.
 
 ### `GET /api/v1/borrowing-rules`
 
-The rules currently active in this process. Any signed-in user.
+The rules loaded from configuration. Any signed-in user.
+
+```bash
+curl -sS -u 'member@library.local:BorrowSelf!26' \
+  'http://localhost:8098/api/v1/borrowing-rules'
+```
 
 **Success — 200**
 
@@ -533,23 +616,13 @@ The rules currently active in this process. Any signed-in user.
 
 **Failure:** 401 `UNAUTHORIZED`.
 
-### `PUT /api/v1/borrowing-rules`
-
-Update borrowing rules in memory. Librarian only. Restart restores defaults from `application.properties` unless that file was changed too.
-
-| Field | In | Type | Mandatory | Validation |
-|---|---|---|---|---|
-| `maxActiveLoans` | body | number | Yes | At least 1 |
-| `blockWhenOverdue` | body | boolean | Yes | |
-| `loanDurationDays` | body | number | Yes | At least 1 |
-
-**Success — 200:** the updated rules (same shape as GET).
-
-**Failure:** 400, 401, 403.
-
 ### `GET /actuator/health/liveness`
 
 Public. No parameters and no body. This only checks that the process answered. It does not call the database.
+
+```bash
+curl -sS 'http://localhost:8098/actuator/health/liveness'
+```
 
 **Success — 200**
 
@@ -564,6 +637,10 @@ Public. No parameters and no body. This only checks that the process answered. I
 ### `GET /actuator/health/readiness`
 
 Public. No parameters and no body. Ready means PostgreSQL answered `SELECT 1` and free disk space is at least 10 MB. `healthy` is true only when both checks passed.
+
+```bash
+curl -sS 'http://localhost:8098/actuator/health/readiness'
+```
 
 **Success — 200**
 
@@ -586,6 +663,10 @@ Public. No parameters and no body. Ready means PostgreSQL answered `SELECT 1` an
 ### `GET /api/v1/metrics`
 
 Loan counters and borrow timings from PostgreSQL. Any signed-in user.
+
+```bash
+curl -sS -u 'librarian:DeskAdmin!26' 'http://localhost:8098/api/v1/metrics'
+```
 
 **Success — 200**
 

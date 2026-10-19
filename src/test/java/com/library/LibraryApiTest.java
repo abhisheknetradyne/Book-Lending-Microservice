@@ -15,7 +15,6 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -27,8 +26,6 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import com.jayway.jsonpath.JsonPath;
-import com.library.config.BorrowingProperties;
-import com.library.config.InMemoryBorrowingRules;
 import com.library.entity.Member;
 import com.library.dao.LoanDao;
 import com.library.dao.MemberDao;
@@ -47,14 +44,6 @@ class LibraryApiTest {
 
 	@Autowired
 	private MemberDao memberDao;
-
-	@Autowired
-	private InMemoryBorrowingRules borrowingRules;
-
-	@BeforeEach
-	void resetBorrowingRules() {
-		borrowingRules.replace(new BorrowingProperties(5, true, 14));
-	}
 
 	@Test
 	void healthChecksProcessDatabaseAndDisk() throws Exception {
@@ -306,21 +295,6 @@ class LibraryApiTest {
 				.andExpect(jsonPath("$.maxActiveLoans").value(5))
 				.andExpect(jsonPath("$.blockWhenOverdue").value(true))
 				.andExpect(jsonPath("$.loanDurationDays").value(14));
-
-		mockMvc.perform(put("/api/v1/borrowing-rules").with(librarian())
-						.contentType(MediaType.APPLICATION_JSON)
-						.content("""
-								{"maxActiveLoans":6,"blockWhenOverdue":true,"loanDurationDays":21}
-								"""))
-				.andExpect(status().isOk())
-				.andExpect(jsonPath("$.maxActiveLoans").value(6))
-				.andExpect(jsonPath("$.loanDurationDays").value(21));
-		mockMvc.perform(put("/api/v1/borrowing-rules").with(member())
-						.contentType(MediaType.APPLICATION_JSON)
-						.content("""
-								{"maxActiveLoans":6,"blockWhenOverdue":true,"loanDurationDays":21}
-								"""))
-				.andExpect(status().isForbidden());
 	}
 
 	private long createBook(String isbn, int copies) throws Exception {
