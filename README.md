@@ -180,8 +180,8 @@ Each API response includes `X-Request-Id`. The same id is written on the log lin
 | Source | Level | When |
 |---|---|---|
 | `RequestIdFilter` | INFO | Every `/api/*` request when it finishes: `method`, `path`, `status` |
-| `ApiExceptionHandler` | WARN | Validation failures (field list), 4xx API errors (`code`, `message`, `path`) |
-| `ApiExceptionHandler` | ERROR | 5xx and unexpected exceptions (stack trace) |
+| `ApiExceptionHandler` | ERROR | Validation failures (`VALIDATION_FAILED`, field list) |
+| `ApiExceptionHandler` | WARN | Other 4xx API errors and unexpected exceptions (`code`, `message`, `path`; stack trace on 5xx) |
 | Service layer (`*ServiceImpl`) | INFO | Mutations started and succeeded (book/member/loan) |
 | Service layer | WARN | Business failures before throw (not found, conflict, borrow rejected, invalid member) |
 | `LoanServiceImpl` | INFO | Borrow/return lifecycle (including idempotent return) |

@@ -106,15 +106,20 @@ public class ApiExceptionHandler {
 	private void logApiError(HttpStatus status, String code, String message, List<ErrorResponse.FieldError> fields,
 			HttpServletRequest request, Throwable cause) {
 		String path = request.getRequestURI();
-		if (status.is5xxServerError()) {
-			log.error("api failed path={} status={} code={} message={}", path, status.value(), code, message, cause);
+		if ("VALIDATION_FAILED".equals(code)) {
+			if (!fields.isEmpty()) {
+				String detail = fields.stream()
+						.map(field -> field.field() + ": " + field.message())
+						.collect(Collectors.joining(", "));
+				log.error("api validation failed path={} status={} fields={}", path, status.value(), detail);
+			} else {
+				log.error("api validation failed path={} status={} code={} message={}", path, status.value(), code, message,
+						cause);
+			}
 			return;
 		}
-		if ("VALIDATION_FAILED".equals(code) && !fields.isEmpty()) {
-			String detail = fields.stream()
-					.map(field -> field.field() + ": " + field.message())
-					.collect(Collectors.joining(", "));
-			log.warn("api validation failed path={} status={} fields={}", path, status.value(), detail);
+		if (status.is5xxServerError()) {
+			log.warn("api failed path={} status={} code={} message={}", path, status.value(), code, message, cause);
 			return;
 		}
 		log.warn("api failed path={} status={} code={} message={}", path, status.value(), code, message);
