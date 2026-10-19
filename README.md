@@ -1,303 +1,463 @@
-# Library Service
+# Book Lending Microservice
 
-A small Java service for a library desk. It keeps a catalog of books, registers members, and lets those members borrow and return books. Borrowing follows a short set of rules that a librarian can change without rebuilding the application.
+## 1. Objective
 
-The service is one Spring Boot process. Data is stored in PostgreSQL. The tables are created from `src/main/resources/schema.sql`.
+A secured Java microservice for a library desk. It manages the book catalog, registers members, and lets a member borrow and return books. Borrowing rules are configurable and are not stored in the database.
 
-## What it does
+## 2. Key features
 
-- Librarians add, edit, and remove books, and register members.
-- Members and librarians borrow and return books.
-- A member can borrow and return only their own loans. A librarian can do that for any member.
-- Three borrowing rules are configurable:
-  - a member cannot hold more than a set number of active loans
-  - a member with an overdue loan cannot borrow again, while that check is turned on
-  - the due date is today plus a configured number of days
-- Borrowing rules live in `application.properties`, not in the database. Restart the service after changing them.
-- Existing loans keep the due date they were given.
-- `GET /actuator/health` reports whether the process, the database, and the disk are up.
-- Metrics record loans borrowed, returned, and refused, and the latency of each API path.
+- Catalog of books, with a unique ISBN and a count of copies still on the shelf.
+- Member records, with a unique email.
+- Borrow and return, including a full borrow history for the librarian.
+- Configurable rules: maximum active loans, block when overdue, and loan duration.
+- HTTP Basic authentication with two predefined roles.
+- Request validation, centralized error responses, health checks, metrics, and request ids.
+- PostgreSQL persistence, with the schema in `src/main/resources/schema.sql`.
+- Swagger UI and automated tests.
 
-## Quick start
+## 3. Roles allowed
 
-Java 17 or newer is required. Check with `java -version`. PostgreSQL must already be running.
+| Role | Username | Password | Allowed operations |
+|---|---|---|---|
+| `LIBRARIAN` | `librarian` | `password` | Manage books and members, view all loans and borrow history, borrow and return for any member |
+| `MEMBER` | `member` | `password` | Read the catalog and the borrowing rules, and borrow, return, and read only their own loans |
+
+The member login is linked to `member@library.local` (Ada Lovelace). A member name is not a username.
+
+## 4. Data model
+
+### Book
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | number | Primary key |
+| `title` | string | Book title, maximum 200 characters |
+| `author` | string | Author, maximum 200 characters |
+| `isbn` | string | Unique ISBN, maximum 20 characters |
+| `totalCopies` | number | Copies owned by the library |
+| `availableCopies` | number | Copies currently on the shelf |
+
+### Member
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | number | Primary key |
+| `name` | string | Member name, maximum 200 characters |
+| `email` | string | Unique email, maximum 200 characters |
+
+### Loan
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | number | Primary key |
+| `bookId` | number | Foreign key to Book |
+| `memberId` | number | Foreign key to Member |
+| `borrowedAt` | string | Borrow time, ISO-8601 UTC |
+| `dueDate` | string | Due time, calculated from the configured duration |
+| `returnedAt` | string or null | Return time. `null` while the loan is open |
+
+## 5. Technical stack
+
+- Java 17
+- Spring Boot 4
+- Spring Web, Spring Security, Spring Data JPA, Hibernate
+- Bean Validation
+- PostgreSQL
+- HikariCP connection pool
+- BCrypt password hashing
+- springdoc OpenAPI / Swagger UI
+- Micrometer and Spring Boot Actuator
+
+## 6. Getting started
+
+Java 17 or newer and PostgreSQL are required.
 
 ```sql
 CREATE USER library WITH PASSWORD 'library';
 CREATE DATABASE library OWNER library;
+CREATE DATABASE library_test OWNER library;
 ```
 
 ```bash
+git clone https://github.com/abhisheknetradyne/Book-Lending-Microservice.git
+cd Book-Lending-Microservice
 ./mvnw spring-boot:run
 ```
 
-The API listens on port **8098**. On startup the service runs `schema.sql`, then writes logs to `logs/`.
+The service listens on http://localhost:8098. On startup it applies `schema.sql` and seeds Ada Lovelace plus two sample books when those rows are missing.
 
 | | |
 |---|---|
-| Swagger UI | http://localhost:8098/swagger-ui/index.html |
+| Swagger UI | http://localhost:8098/swagger-ui.html |
 | OpenAPI JSON | http://localhost:8098/v3/api-docs |
 | Health | http://localhost:8098/actuator/health |
 
-Stop the process with Ctrl+C. Start it again and the books, members, and loans are still in PostgreSQL. Borrowing rules are read from `application.properties` on each start.
+In Swagger, choose **Authorize** and enter `librarian` / `password` or `member` / `password`.
 
-To wipe the data and go back to the sample rows, stop the service and drop the tables in the `library` database. The next start runs `schema.sql` again and seeds an empty database.
+Tests use the `library_test` database:
 
-## Sign in
+```bash
+./mvnw test
+```
 
-Authentication is HTTP Basic. The accounts are in `application-security.properties`. There is no separate identity provider.
+## 7. Security
 
-| User | Password | Role |
+- Use HTTPS outside local development.
+- Every `/api/v1` call requires HTTP Basic credentials. Health is public.
+- Passwords in `application-security.properties` are hashed with BCrypt when the process starts.
+- A member can act only on the member row linked to their login.
+
+## 8. Borrowing rules
+
+These values are in `application.properties`. They are not stored in the database. Change them and restart the service.
+
+```properties
+library.borrowing.max-active-loans=5
+library.borrowing.block-when-overdue=true
+library.borrowing.loan-duration-days=14
+```
+
+On each borrow, the service locks the book row and then checks, in order:
+
+1. At least one copy is available.
+2. This member does not already have this book out.
+3. Open loans are below `max-active-loans`.
+4. If `block-when-overdue` is true, no open loan has a due date in the past.
+
+The due date is the borrow time plus `loan-duration-days`. A loan that already exists keeps its original due date.
+
+## 9. Observability
+
+Each API response includes `X-Request-Id`. The same id is written on the log line for that call. Logs go to the terminal and to `logs/library-service.log`.
+
+`GET /actuator/health` is up only when the process, the database, and disk space are up.
+
+| Metric | Description |
+|---|---|
+| `library.loans.borrowed` | Loans created |
+| `library.loans.returned` | Books returned |
+| `library.loans.rejected` | Refusals, tagged with the rule code |
+| `library.loans.active` | Open loans |
+| `library.loans.borrow` | Time spent inside borrow |
+| `http.server.requests` | Latency of each API path |
+
+## 10. API details
+
+All application APIs are under `/api/v1` and use JSON.
+
+### Common headers
+
+| Header | Mandatory | Description |
 |---|---|---|
-| `librarian` | `password` | Manages the catalog and members, views all borrow history, and can borrow or return for any member. |
-| `member` | `password` | Ada Lovelace (`member@library.local`). Can read the catalog and borrow or return only her own books. |
+| `Authorization` | Yes, except health | `Basic` credentials for `librarian` or `member` |
+| `Content-Type` | Yes, when a body is sent | `application/json` |
 
-In Swagger UI, choose **Authorize** and enter one of these pairs.
+### Common error response
 
-Two books are created on a fresh database: *Clean Code* and *Effective Java*.
-
-## Try the main path
-
-List the sample member and books (on a fresh database these ids are `1`):
-
-```bash
-curl -s -u librarian:password http://localhost:8098/api/v1/members
-curl -s -u librarian:password http://localhost:8098/api/v1/books
+```json
+{
+  "timestamp": "2026-10-19T01:30:00Z",
+  "path": "/api/v1/loans",
+  "code": "VALIDATION_FAILED",
+  "message": "Request validation failed",
+  "fieldErrors": [
+    {
+      "field": "isbn",
+      "message": "must not be blank"
+    }
+  ]
+}
 ```
 
-Borrow as the member:
-
-```bash
-curl -s -u member:password \
-  -H 'Content-Type: application/json' \
-  -d '{"memberId":1,"bookId":1}' \
-  http://localhost:8098/api/v1/loans
-```
-
-Return it:
-
-```bash
-curl -s -u member:password -X POST http://localhost:8098/api/v1/loans/1/return
-```
-
-Read the limits the service is enforcing. They come from `application.properties`, not from the database:
-
-```bash
-curl -s -u librarian:password \
-  http://localhost:8098/api/v1/borrowing-rules
-```
-
-## REST API reference
-
-The interactive contract is available at `/swagger-ui.html`; the OpenAPI JSON is at `/v3/api-docs`. All application endpoints use JSON and start with `/api/v1`.
-
-### Common rules
-
-- Authentication is HTTP Basic. Except for health, every endpoint requires credentials.
-- Send `Content-Type: application/json` for request bodies.
-- IDs are JSON numbers / Java `Long` values and must be positive.
-- `page` is a zero-based integer, default `0`, minimum `0`.
-- `size` is an integer, default `20`, minimum `1`, maximum `100`.
-- Times are ISO-8601 UTC strings, for example `"2026-10-19T01:30:00Z"`.
-- Paginated responses have `content` (array), `page` (integer), `size` (integer), `totalElements` (long), and `totalPages` (integer).
-- Every response includes an `X-Request-Id` header.
-
-### Request and response schemas
-
-#### Book request
-
-| Field | JSON type | Required | Validation |
-|---|---|---|---|
-| `title` | string | yes | Not blank; maximum 200 characters |
-| `author` | string | yes | Not blank; maximum 200 characters |
-| `isbn` | string | yes | Not blank; maximum 20 characters; unique ignoring case |
-| `totalCopies` | integer | yes | From 1 through 10,000 |
-
-#### Book response
-
-| Field | JSON type | Nullable | Meaning |
-|---|---|---|---|
-| `id` | integer (64-bit) | no | Book identifier |
-| `title` | string | no | Book title |
-| `author` | string | no | Author name |
-| `isbn` | string | no | Unique ISBN |
-| `totalCopies` | integer | no | Copies owned |
-| `availableCopies` | integer | no | Copies currently available |
-
-#### Member request
-
-| Field | JSON type | Required | Validation |
-|---|---|---|---|
-| `name` | string | yes | Not blank; maximum 200 characters |
-| `email` | string | yes | Valid email; maximum 200 characters; unique ignoring case |
-
-`PATCH /members/{id}` accepts only `name` with the same validation.
-
-#### Member response
-
-| Field | JSON type | Nullable |
+| Field | Type | Description |
 |---|---|---|
-| `id` | integer (64-bit) | no |
-| `name` | string | no |
-| `email` | string | no |
+| `timestamp` | string | UTC time of the error |
+| `path` | string | Request path |
+| `code` | string | Stable error code |
+| `message` | string | Human-readable message |
+| `fieldErrors` | array | Empty unless a field failed validation. Each item has `field` and `message` strings |
 
-#### Loan request
+| HTTP status | Code | When |
+|---|---|---|
+| 400 | `VALIDATION_FAILED` | A body, path, or query value breaks a validation rule |
+| 400 | `MALFORMED_REQUEST` | The JSON body is missing or cannot be read |
+| 400 | `MALFORMED_PARAMETER` | A path or query value has the wrong type |
+| 401 | `UNAUTHORIZED` | Credentials are missing or wrong |
+| 403 | `FORBIDDEN` | The signed-in user cannot perform this operation |
+| 404 | `NOT_FOUND` | The book, member, or loan does not exist |
+| 409 | endpoint code | A business rule or database constraint rejected the request |
 
-| Field | JSON type | Required | Validation |
-|---|---|---|---|
-| `memberId` | integer (64-bit) | yes | Positive; member must exist |
-| `bookId` | integer (64-bit) | yes | Positive; book must exist |
+Paging parameters, used by every list endpoint:
 
-#### Loan response
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `page` | query | number | No | Zero-based page. Default `0`. Minimum `0` |
+| `size` | query | number | No | Page size. Default `20`. Minimum `1`. Maximum `100` |
 
-| Field | JSON type | Nullable | Meaning |
-|---|---|---|---|
-| `id` | integer (64-bit) | no | Loan identifier |
-| `bookId` | integer (64-bit) | no | Borrowed book |
-| `memberId` | integer (64-bit) | no | Borrowing member |
-| `borrowedAt` | ISO-8601 string | no | Borrow time |
-| `dueDate` | ISO-8601 string | no | Configured due time |
-| `returnedAt` | ISO-8601 string | yes | `null` while the loan is open |
+A paged response contains `content` (array), `page` (number), `size` (number), `totalElements` (number), and `totalPages` (number).
 
-### Books
+### `GET /api/v1/books`
 
-#### `GET /api/v1/books`
+List books. Any signed-in user.
 
-Lists books. Any authenticated user may call it.
+**Query parameters:** `page`, `size`.
 
-Parameters: query `page` (integer, optional, default `0`) and `size` (integer, optional, default `20`).
+**Success — 200**
 
-- Success: **200 OK**, `PageResponse<BookResponse>`.
-- Failure: **400 Bad Request** for invalid paging; **401 Unauthorized** for missing or invalid credentials.
+```json
+{
+  "content": [
+    {
+      "id": 1,
+      "title": "Clean Code",
+      "author": "Robert C. Martin",
+      "isbn": "9780132350884",
+      "totalCopies": 3,
+      "availableCopies": 3
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
 
-#### `GET /api/v1/books/{id}`
+**Failure:** 400 `VALIDATION_FAILED` for an invalid page or size. 401 `UNAUTHORIZED`.
 
-Returns one book. Any authenticated user may call it.
+### `GET /api/v1/books/{id}`
 
-Parameters: path `id` (positive 64-bit integer, required).
+One book. Any signed-in user.
 
-- Success: **200 OK**, `BookResponse`.
-- Failure: **400 Bad Request** for an invalid ID; **401 Unauthorized**; **404 Not Found** when the book does not exist.
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Book id. Must be a positive whole number |
 
-#### `POST /api/v1/books`
+**Success — 200:** one book object, same fields as an item in the list above.
 
-Adds a book. Librarian only. Body: `BookRequest`.
+**Failure:** 400 `MALFORMED_PARAMETER` or `VALIDATION_FAILED`. 401 `UNAUTHORIZED`. 404 `NOT_FOUND`.
 
-- Success: **201 Created**, `BookResponse`.
-- Failure: **400 Bad Request** for validation or malformed JSON; **401 Unauthorized**; **403 Forbidden** for a member; **409 Conflict** with `ISBN_ALREADY_EXISTS` or `DATA_CONFLICT`.
+### `POST /api/v1/books`
 
-#### `PUT /api/v1/books/{id}`
+Add a book. Librarian only.
 
-Replaces the editable book values. Librarian only.
+| Field | In | Type | Mandatory | Validation |
+|---|---|---|---|---|
+| `title` | body | string | Yes | Not blank, maximum 200 characters |
+| `author` | body | string | Yes | Not blank, maximum 200 characters |
+| `isbn` | body | string | Yes | Not blank, maximum 20 characters, unique ignoring case |
+| `totalCopies` | body | number | Yes | Integer from 1 through 10000 |
 
-Parameters: path `id` (positive 64-bit integer, required). Body: `BookRequest`.
+```json
+{
+  "title": "Effective Java",
+  "author": "Joshua Bloch",
+  "isbn": "9780134685991",
+  "totalCopies": 2
+}
+```
 
-- Success: **200 OK**, `BookResponse`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**; **404 Not Found**; **409 Conflict** with `ISBN_ALREADY_EXISTS`, `COPIES_BELOW_LOANS`, `CONCURRENT_UPDATE`, or `DATA_CONFLICT`.
+**Success — 201:** the created book, including `id` and `availableCopies`.
 
-#### `DELETE /api/v1/books/{id}`
+**Failure:** 400 `VALIDATION_FAILED` or `MALFORMED_REQUEST`. 401 `UNAUTHORIZED`. 403 `FORBIDDEN`. 409 `ISBN_ALREADY_EXISTS` or `DATA_CONFLICT`.
 
-Deletes a book. Librarian only. Deletion is refused while any copy has an open loan.
+### `PUT /api/v1/books/{id}`
 
-Parameters: path `id` (positive 64-bit integer, required).
+Replace the title, author, ISBN, and total copies. Librarian only. Total copies cannot fall below the number currently on loan.
 
-- Success: **204 No Content**, empty body.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**; **404 Not Found**; **409 Conflict** with `BOOK_HAS_OPEN_LOANS`.
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive book id |
+| body | body | object | Yes | Same fields and validation as `POST /api/v1/books` |
 
-### Members
+**Success — 200:** the updated book.
 
-#### `GET /api/v1/members`
+**Failure:** 400, 401, 403, 404. 409 `ISBN_ALREADY_EXISTS`, `COPIES_BELOW_LOANS`, `CONCURRENT_UPDATE`, or `DATA_CONFLICT`.
 
-Lists members. Librarian only.
+### `DELETE /api/v1/books/{id}`
 
-Parameters: query `page` (integer, optional, default `0`) and `size` (integer, optional, default `20`).
+Delete a book. Librarian only. Refused while any copy is on loan.
 
-- Success: **200 OK**, `PageResponse<MemberResponse>`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**.
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive book id |
 
-#### `GET /api/v1/members/{id}`
+**Success — 204:** empty body.
 
-A librarian may read any member. A member login may read only its linked member.
+**Failure:** 400, 401, 403, 404. 409 `BOOK_HAS_OPEN_LOANS`.
 
-Parameters: path `id` (positive 64-bit integer, required).
+### `GET /api/v1/members`
 
-- Success: **200 OK**, `MemberResponse`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden** when a member requests another member; **404 Not Found**.
+List members. Librarian only.
 
-#### `POST /api/v1/members`
+**Query parameters:** `page`, `size`.
 
-Registers a member. Librarian only. Body: `MemberRequest`.
+**Success — 200**
 
-- Success: **201 Created**, `MemberResponse`.
-- Failure: **400 Bad Request** for validation or malformed JSON; **401 Unauthorized**; **403 Forbidden**; **409 Conflict** with `EMAIL_ALREADY_EXISTS` or `DATA_CONFLICT`.
+```json
+{
+  "content": [
+    {
+      "id": 1,
+      "name": "Ada Lovelace",
+      "email": "member@library.local"
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
 
-#### `PATCH /api/v1/members/{id}`
+**Failure:** 400, 401, 403.
 
-Changes a member name. Librarian only.
+### `POST /api/v1/members`
 
-Parameters: path `id` (positive 64-bit integer, required). Body: `{ "name": "New name" }`.
+Register a member. Librarian only. This creates a member record. It does not create a login.
 
-- Success: **200 OK**, `MemberResponse`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**; **404 Not Found**.
+| Field | In | Type | Mandatory | Validation |
+|---|---|---|---|---|
+| `name` | body | string | Yes | Not blank, maximum 200 characters |
+| `email` | body | string | Yes | Valid email, maximum 200 characters, unique ignoring case |
 
-### Loans
+```json
+{
+  "name": "Grace Hopper",
+  "email": "grace@library.local"
+}
+```
 
-#### `GET /api/v1/loans`
+**Success — 201:** the created member.
 
-A librarian can list all loans or filter by member. A member always receives only its own loans.
+**Failure:** 400, 401, 403. 409 `EMAIL_ALREADY_EXISTS` or `DATA_CONFLICT`.
 
-Parameters: query `memberId` (positive 64-bit integer, optional), `page` (integer, optional, default `0`), and `size` (integer, optional, default `20`).
+### `GET /api/v1/members/{id}`
 
-- Success: **200 OK**, `PageResponse<LoanResponse>`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden** if a member requests another member.
+A librarian can read any member. A member can read only their own record.
 
-#### `GET /api/v1/loans/{id}`
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive member id |
 
-Returns one loan. A librarian can read any loan; a member can read only its own.
+**Success — 200:** one member object.
 
-Parameters: path `id` (positive 64-bit integer, required).
+**Failure:** 400, 401, 404. 403 when a member asks for someone else.
 
-- Success: **200 OK**, `LoanResponse`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**; **404 Not Found**.
+### `PATCH /api/v1/members/{id}`
 
-#### `POST /api/v1/loans`
+Change a member name. Librarian only. Email cannot be changed here.
 
-Borrows one copy. A member may borrow only for itself; a librarian may borrow for any member. Body: `LoanRequest`.
+| Parameter | In | Type | Mandatory | Validation |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive member id |
+| `name` | body | string | Yes | Not blank, maximum 200 characters |
 
-- Success: **201 Created**, `LoanResponse`.
-- Failure: **400 Bad Request** for validation or malformed JSON; **401 Unauthorized**; **403 Forbidden**; **404 Not Found** for an unknown member or book; **409 Conflict** with:
-  - `NO_COPIES_AVAILABLE` — no copy is available.
-  - `ALREADY_BORROWED` — this member already has this book.
-  - `LOAN_LIMIT_REACHED` — the member has reached the configured active-loan limit.
-  - `MEMBER_HAS_OVERDUE` — an open loan is overdue.
+```json
+{
+  "name": "Ada Lovelace"
+}
+```
 
-The book row is locked during this operation. If two requests compete for the last copy, one succeeds and the other receives `NO_COPIES_AVAILABLE`.
+**Success — 200:** the updated member.
 
-#### `POST /api/v1/loans/{id}/return`
+**Failure:** 400, 401, 403, 404.
 
-Returns a book. A member may return only its own loan; a librarian may return any loan. Repeating a completed return is idempotent.
+### `POST /api/v1/loans`
 
-Parameters: path `id` (positive 64-bit integer, required).
+Borrow one copy. A member may borrow only for their own member id. A librarian may borrow for any member.
 
-- Success: **200 OK**, `LoanResponse`. `returnedAt` is populated.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**; **404 Not Found**.
+| Field | In | Type | Mandatory | Validation |
+|---|---|---|---|---|
+| `memberId` | body | number | Yes | Positive, and the member must exist |
+| `bookId` | body | number | Yes | Positive, and the book must exist |
 
-### Borrow history and rules
+```json
+{
+  "memberId": 1,
+  "bookId": 1
+}
+```
 
-#### `GET /api/v1/borrow-history`
+**Success — 201**
 
-Returns every borrow and return record. Librarian only.
+```json
+{
+  "id": 10,
+  "bookId": 1,
+  "memberId": 1,
+  "borrowedAt": "2026-10-19T01:30:00Z",
+  "dueDate": "2026-11-02T01:30:00Z",
+  "returnedAt": null
+}
+```
 
-Parameters: query `page` (integer, optional, default `0`) and `size` (integer, optional, default `20`).
+**Failure:** 400, 401, 403, 404.
 
-- Success: **200 OK**, `PageResponse<LoanResponse>`.
-- Failure: **400 Bad Request**; **401 Unauthorized**; **403 Forbidden**.
+| 409 code | Message |
+|---|---|
+| `NO_COPIES_AVAILABLE` | No copies of this book are available |
+| `ALREADY_BORROWED` | This member already has an open loan for the book |
+| `LOAN_LIMIT_REACHED` | Member already has 5 active loans |
+| `MEMBER_HAS_OVERDUE` | Member has an overdue loan |
 
-#### `GET /api/v1/borrowing-rules`
+The 5 and the 14-day due date come from configuration. If two requests compete for the last copy, the book row is locked: one request returns 201 and the other returns 409 `NO_COPIES_AVAILABLE`.
 
-Returns the rules loaded from `application.properties`. Any authenticated user may call it. It accepts no parameters.
+### `POST /api/v1/loans/{id}/return`
 
-- Success: **200 OK**:
+Return a book. A member may return only their own loan. A librarian may return any loan. Returning a loan that is already returned does not change it.
+
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive loan id |
+
+**Request body:** none.
+
+**Success — 200:** the loan, with `returnedAt` set. A second return returns the same loan and still 200.
+
+**Failure:** 400, 401, 403, 404.
+
+### `GET /api/v1/loans`
+
+List loans. A librarian can list every loan or filter by member. A member always receives only their own loans.
+
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `memberId` | query | number | No | Positive member id. A member cannot ask for another member |
+| `page` | query | number | No | Page, default 0 |
+| `size` | query | number | No | Page size, default 20 |
+
+**Success — 200:** a page of loan objects.
+
+**Failure:** 400, 401. 403 when a member requests another member's loans.
+
+### `GET /api/v1/loans/{id}`
+
+One loan. A librarian can read any loan. A member can read only their own.
+
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `id` | path | number | Yes | Positive loan id |
+
+**Success — 200:** one loan object.
+
+**Failure:** 400, 401, 403, 404.
+
+### `GET /api/v1/borrow-history`
+
+Every borrow and return record. Librarian only.
+
+**Query parameters:** `page`, `size`.
+
+**Success — 200:** a page of loan objects, including returned loans.
+
+**Failure:** 400, 401, 403.
+
+### `GET /api/v1/borrowing-rules`
+
+The rules currently loaded from `application.properties`. Any signed-in user. No parameters.
+
+**Success — 200**
 
 ```json
 {
@@ -307,139 +467,38 @@ Returns the rules loaded from `application.properties`. Any authenticated user m
 }
 ```
 
-- Failure: **401 Unauthorized**.
+**Failure:** 401 `UNAUTHORIZED`.
 
-### Observability endpoints
+### `GET /actuator/health`
 
-#### `GET /actuator/health`
+Public. No parameters and no body.
 
-Public; no parameters.
+**Success — 200:** status `UP`, with `ping`, `db`, and `diskSpace` components.
 
-- Success: **200 OK** when process, database, and disk checks are up.
-- Failure: **503 Service Unavailable** when a health component is down.
+**Failure — 503:** status `DOWN` when one of those checks fails.
 
-#### `GET /actuator/metrics` and `GET /actuator/metrics/{metricName}`
+### `GET /actuator/metrics` and `GET /actuator/metrics/{metricName}`
 
-Any authenticated user. `metricName` is a string. The detail endpoint also accepts repeatable query parameter `tag` as a string in `key:value` format.
+Any signed-in user.
 
-- Success: **200 OK**, Spring Boot Actuator metric JSON.
-- Failure: **401 Unauthorized**; **404 Not Found** for an unknown metric.
+| Parameter | In | Type | Mandatory | Description |
+|---|---|---|---|---|
+| `metricName` | path | string | Yes, on the detail call | Metric name, such as `library.loans.borrowed` |
+| `tag` | query | string | No | Repeatable `key:value` filter |
 
-### Error responses
+**Success — 200:** Actuator metric JSON.
 
-Application errors use this schema:
+**Failure:** 401. 404 when the metric name does not exist.
 
-```json
-{
-  "timestamp": "2026-10-19T01:30:00Z",
-  "path": "/api/v1/loans",
-  "code": "LOAN_LIMIT_REACHED",
-  "message": "Member already has 5 active loans",
-  "fieldErrors": []
-}
-```
+## 11. Edge cases
 
-`timestamp`, `path`, `code`, and `message` are strings. `fieldErrors` is an array of `{ "field": string, "message": string }`.
-
-Common status codes:
-
-| HTTP status | Error code | Meaning |
-|---|---|---|
-| **400 Bad Request** | `VALIDATION_FAILED` | A body, path, or query value violates validation |
-| **400 Bad Request** | `MALFORMED_REQUEST` | The JSON body is missing or malformed |
-| **400 Bad Request** | `MALFORMED_PARAMETER` | A path or query value has the wrong type |
-| **401 Unauthorized** | `UNAUTHORIZED` | Basic credentials are missing or invalid |
-| **403 Forbidden** | `FORBIDDEN` | The authenticated user cannot perform the operation |
-| **404 Not Found** | `NOT_FOUND` | The requested entity does not exist |
-| **409 Conflict** | endpoint-specific code | A business rule or database constraint rejected the operation |
-
-## Borrowing rules
-
-Each borrow loads the member, the book, and that member's open loans, then runs the rules in order. The first refusal stops the borrow.
-
-1. A copy is on the shelf.
-2. The member does not already have this book out.
-3. Open loans are below `maxActiveLoans`. An open loan is one whose `returnedAt` is empty.
-4. If `blockWhenOverdue` is true, none of those loans have a `dueDate` in the past.
-
-If they all pass, the due date is the borrow time plus `loanDurationDays`.
-
-`src/main/resources/application.properties` holds the starting values:
-
-```properties
-library.borrowing.max-active-loans=5
-library.borrowing.block-when-overdue=true
-library.borrowing.loan-duration-days=14
-```
-
-Those values are the rules. They are not stored in the database. Change them in `application.properties` and restart the service. Every instance that shares that configuration enforces the same limit.
-
-A new kind of restriction is a new `BorrowingRule` class. The borrow path does not need a new branch.
-
-## Security
-
-`SecurityConfig` loads the users from `library.security.users` in `application-security.properties` and stores bcrypt hashes in memory. Passwords in that file are the ones clients send. They are hashed when the process starts. Log settings are in `application-logging.properties`.
-
-A member login has `member-email`. That email must match a member row. The sample login matches Ada Lovelace.
-
-## Observability
-
-`GET /actuator/health` is the only health API. It is up only when all three checks are up:
-
-- `ping` — the process answered
-- `db` — the database accepts a connection
-- `diskSpace` — free space is above 10MB
-
-Useful metrics:
-
-| Metric | Meaning |
+| Case | Result |
 |---|---|
-| `library.loans.borrowed` | Loans created |
-| `library.loans.returned` | Books returned |
-| `library.loans.rejected` | Refusals, tagged with the rule `code` |
-| `library.loans.active` | Open loans right now |
-| `library.loans.borrow` | Time spent inside the borrow operation |
-| `http.server.requests` | Latency of each API path, tagged with `method` and `uri` |
-
-```bash
-curl -s -u librarian:password \
-  'http://localhost:8098/actuator/metrics/http.server.requests?tag=method:POST&tag=uri:/api/v1/loans'
-```
-
-Each API response includes `X-Request-Id`. The same id is on the log line for that call. Logs go to the terminal and to `logs/library-service.log`.
-
-## How the code is organized
-
-```text
-controller     HTTP endpoints
-dto            request and response records
-entity         books, members, and loans
-exception      error types and the API error handler
-service        use-case interfaces
-serviceimpl    use-case implementations
-domain/rules   borrowing rules
-repository     JPA SqlSession. Connections come from the Hikari pool
-config         security, properties, seeding, metrics, OpenAPI
-```
-
-Controllers depend on the service interfaces. Those implementations call `sqlSession`, which uses the JPA session. Each database call checks a connection out of the Hikari pool.
-
-## Tests
-
-```bash
-./mvnw test
-```
-
-Rule tests cover each borrowing decision without starting the server. The API test uses the local PostgreSQL database `library_test` and walks through security, borrow, return, the loan limit, overdue loans, health, and metrics.
-
-## Configuration
-
-| Property | Purpose |
-|---|---|
-| `server.port` | HTTP port. Default `8098` |
-| `library.borrowing.*` | Borrowing rules. Not stored in the database. Restart after a change. |
-| `library.security.users[*]` | Usernames, passwords, roles, and the member email for a member login. File: `application-security.properties` |
-| `logging.file.name` | Log file path. File: `application-logging.properties` |
-| `logging.level.*` | Log levels. File: `application-logging.properties` |
-| `spring.datasource.url` | PostgreSQL database. Default `jdbc:postgresql://localhost:5432/library` |
-| `spring.datasource.hikari.*` | Connection pool size and timeout. The JPA session borrows connections from this pool. |
+| Two members request the last copy at the same time | One receives 201. The other receives 409 `NO_COPIES_AVAILABLE` |
+| The same member borrows the same book twice while the first loan is open | 409 `ALREADY_BORROWED` |
+| The member already has the configured number of open loans | 409 `LOAN_LIMIT_REACHED` |
+| An open loan is past its due date and blocking is enabled | 409 `MEMBER_HAS_OVERDUE` |
+| A book is deleted while a copy is still out | 409 `BOOK_HAS_OPEN_LOANS` |
+| Total copies would drop below copies on loan | 409 `COPIES_BELOW_LOANS` |
+| Return is called again after the book is back | 200, and the loan is unchanged |
+| A member calls a librarian operation | 403 `FORBIDDEN` |
